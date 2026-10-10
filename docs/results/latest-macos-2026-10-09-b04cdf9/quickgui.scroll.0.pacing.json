@@ -1,0 +1,14 @@
+{
+ "framework": "quickgui",
+ "mode": "scroll",
+ "repeat": 0,
+ "display_hz": 120,
+ "frames": 502,
+ "frames_per_second": 62.75,
+ "interval_p50_ms": 18.152,
+ "interval_p95_ms": 25.133,
+ "interval_p99_ms": 29.22,
+ "interval_max_ms": 33.499,
+ "long_intervals": 31,
+ "long_interval_fraction": 0.06188
+}

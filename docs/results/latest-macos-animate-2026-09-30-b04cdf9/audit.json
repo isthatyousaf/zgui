@@ -1,0 +1,55 @@
+{
+ "accepted": true,
+ "trials": 9,
+ "samples": 2504,
+ "pacing_trials": 6,
+ "reported_fps": {
+  "min": 86.9,
+  "max": 94.7
+ },
+ "powermetrics": false,
+ "scene": "animate",
+ "commit": "b04cdf9232b0b03a1b09f26ec20d8a99da9ede29",
+ "source_dirty": true,
+ "source_diff_sha256": "d639423468497e7328d08aee58ea8c6bff8f666f37d88284a85180d48657981d",
+ "started_utc": "2026-09-30T07:24:39.716108+00:00",
+ "finished_utc": "2026-09-30T07:29:38.977095+00:00",
+ "environment": {
+  "machine": "Mac17,6",
+  "chip": "Apple M5 Max",
+  "cores": 18,
+  "memory_bytes": 137438953472,
+  "macos": "26.4 (25E246)",
+  "power": "AC Power",
+  "rust": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+ },
+ "binaries": {
+  "zgui": {
+   "sha256": "0541cfdfc4e4d6428995aad61993a036dbcb443bb23fc69d9d3ab2cfe38183f0",
+   "bytes": 10765040
+  },
+  "gpui": {
+   "sha256": "3720fa1ee3810876efd812adea2d0a689618ad1f47507203c385dcfa6218cd9e",
+   "bytes": 4567776
+  }
+ },
+ "protocol": {
+  "requested_seconds": 20,
+  "warmup_seconds": 5,
+  "sampled_seconds": 15,
+  "interval_seconds": 0.05,
+  "repeats": 3,
+  "frameworks": [
+   "zgui",
+   "gpui"
+  ],
+  "modes": [
+   "animate"
+  ],
+  "pacing_seconds": 8,
+  "acceptance_updates_per_second": [
+   58,
+   61
+  ]
+ }
+}

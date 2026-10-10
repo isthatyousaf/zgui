@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="description" content="zgui against GPUI, GPUI Fast and QuickGUI on macOS with Metal: CPU, GPU, memory and frame pacing across three workloads.">
+<title>zgui on macOS — measured against GPUI and GPUI Fast</title>
+<link rel="stylesheet" href="compare.css">
+</head>
+<body>
+<div class="viz-root">
+<header class="top">
+  <a class="brand" href="../">z<span>gui</span> <i>/ performance lab</i></a>
+  <a href="#method">How it was measured</a>
+</header>
+<main>
+  <section class="hero">
+    <p class="eyebrow">macOS · Apple Silicon · Metal</p>
+    <h1>Damage-based rendering, measured.</h1>
+    <p class="intro">Three workloads, the same UI built in each framework, the same Mac.
+      CPU, GPU and memory for every framework, medians of three runs.
+      Lower is better unless a chart says otherwise.</p>
+    <p class="run" id="run"></p>
+  </section>
+
+  <section class="controls" aria-label="Choose a workload">
+    <div class="tabs" role="group" aria-label="Workload" id="scenes"></div>
+    <p class="scene-note" id="scene-note"></p>
+  </section>
+
+  <section class="tiles" id="tiles" aria-label="Headline comparisons"></section>
+
+  <section aria-label="Charts">
+    <div class="legend" id="legend"></div>
+    <div class="charts" id="charts"></div>
+  </section>
+
+  <section class="table-section" aria-label="All numbers">
+    <h2>Every number behind the bars</h2>
+    <p class="note">Median of three runs, with the observed minimum–maximum. Ranges are not confidence intervals.</p>
+    <div class="table-scroll"><table id="table"></table></div>
+  </section>
+
+  <section class="method" id="method">
+    <h2>How it was measured</h2>
+    <div class="grid">
+      <article><h3>Same work</h3><p>Each framework runs the same UI from a shared workload crate: a streaming transcript and a 100,000-row virtual list (lab), a 1280×800 dashboard where most values change every tick (heavy), and dots and text animated at the display's rate (animation). Lab and heavy updates arrive 60 times a second, and a run counts only if it delivers 58–61 a second; the animation draws as often as each framework presents.</p></article>
+      <article><h3>Sampling</h3><p>Every trial runs 20 seconds; the first 5 are excluded and the next 15 sampled every 50 ms. Three repeats per framework and mode, in rotated order, with the desktop alone measured each repeat. Frame pacing is timed separately by capturing each window's frames.</p></article>
+      <article><h3>GPU, fairly</h3><p>GPU work is how long the GPU ran each app's vertex and fragment work, from Metal System Trace captures of each app alone (5 seconds, three per framework and mode). IOKit's per-app GPU time, also shown, adds each command buffer's fixed cost and stretches as the GPU clocks down; it is multiplied by the mean active clock to give megacycles a second.</p></article>
+      <article><h3>Memory</h3><p>Physical footprint, as Activity Monitor reports it, including GPU memory the process owns. Any process that has used the GPU in the last second or two holds about 180–190 MB of Metal driver memory, so differences come down to the last 50–60 MB.</p></article>
+      <article><h3>Not isolated</h3><p>A personal Mac in use: a live wallpaper and other apps kept the GPU about 45% busy, and per-app GPU readings vary two- to threefold between runs. Small GPU differences are within that noise; the pacing and CPU numbers are steadier.</p></article>
+      <article><h3>Source</h3><p id="source"></p></article>
+    </div>
+  </section>
+</main>
+<footer><span>zgui / retained Rust interfaces</span><a href="data.json" download>Download the data ↓</a></footer>
+<div class="tooltip" id="tooltip" role="status" hidden></div>
+</div>
+<script src="compare.js"></script>
+</body>
+</html>

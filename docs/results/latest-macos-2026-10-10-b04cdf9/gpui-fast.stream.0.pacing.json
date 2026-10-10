@@ -1,0 +1,14 @@
+{
+ "framework": "gpui-fast",
+ "mode": "stream",
+ "repeat": 0,
+ "display_hz": 120,
+ "frames": 477,
+ "frames_per_second": 59.625,
+ "interval_p50_ms": 18.55,
+ "interval_p95_ms": 29.428,
+ "interval_p99_ms": 32.045,
+ "interval_max_ms": 33.215,
+ "long_intervals": 64,
+ "long_interval_fraction": 0.13445
+}

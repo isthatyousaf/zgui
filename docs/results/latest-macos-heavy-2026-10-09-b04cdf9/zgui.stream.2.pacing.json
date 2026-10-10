@@ -1,0 +1,14 @@
+{
+ "framework": "zgui",
+ "mode": "stream",
+ "repeat": 2,
+ "display_hz": 120,
+ "frames": 474,
+ "frames_per_second": 59.25,
+ "interval_p50_ms": 17.705,
+ "interval_p95_ms": 29.106,
+ "interval_p99_ms": 31.965,
+ "interval_max_ms": 33.328,
+ "long_intervals": 105,
+ "long_interval_fraction": 0.22199
+}

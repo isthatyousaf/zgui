@@ -1,0 +1,10 @@
+framework,mode,repeat,display_hz,frames,frames_per_second,interval_p50_ms,interval_p95_ms,interval_p99_ms,interval_max_ms,long_interval_fraction,long_intervals
+zgui,animate,0,120,804,100.5,9.381,17.492,21.912,22.855,0.0,0
+gpui,animate,0,120,836,104.5,9.302,12.02,12.979,19.498,0.0,0
+gpui-fast,animate,0,120,874,109.25,9.006,12.02,17.794,22.831,0.0,0
+gpui,animate,1,120,866,108.25,9.423,11.948,12.723,19.997,0.0,0
+gpui-fast,animate,1,120,835,104.375,9.28,12.027,14.294,20.46,0.0,0
+zgui,animate,1,120,751,93.875,10.103,18.252,21.027,22.333,0.0,0
+gpui-fast,animate,2,120,875,109.375,9.257,11.869,19.515,23.67,0.0,0
+zgui,animate,2,120,757,94.625,9.677,18.159,21.388,27.758,0.00132,1
+gpui,animate,2,120,821,102.625,9.277,12.09,13.224,24.474,0.0,0

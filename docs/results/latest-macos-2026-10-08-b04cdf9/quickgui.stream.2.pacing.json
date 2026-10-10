@@ -1,0 +1,14 @@
+{
+ "framework": "quickgui",
+ "mode": "stream",
+ "repeat": 2,
+ "display_hz": 120,
+ "frames": 509,
+ "frames_per_second": 63.625,
+ "interval_p50_ms": 18.014,
+ "interval_p95_ms": 23.403,
+ "interval_p99_ms": 26.151,
+ "interval_max_ms": 32.826,
+ "long_intervals": 10,
+ "long_interval_fraction": 0.01969
+}
