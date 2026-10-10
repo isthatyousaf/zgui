@@ -66,6 +66,9 @@ const METRICS = [
   { id: 'pacing', title: 'Frame pacing', unit: 'ms, 99th-percentile frame interval', digits: 1, skipIdle: true, pacing: true,
     get: (s, g, p) => stat(p, 'interval_p99_ms'),
     caption: 'Intervals between frames that reached the screen, from a capture of each window.' },
+  { id: 'late', title: 'Late frames', unit: '% of frame intervals over 25 ms', digits: 1, skipIdle: true, except: 'animate',
+    get: (s, g, p) => stat(p, 'long_interval_fraction', (v) => v * 100),
+    caption: 'Updates come 60 times a second, one every 16.7 ms: an interval past 25 ms means a frame missed its refresh. Steadier than the 99th percentile, which where an app’s timer falls against the refresh moves by 5 ms or more from capture to capture.' },
   { id: 'fps', title: 'Frames drawn', unit: 'frames / second', digits: 0, only: 'animate', higher: true,
     get: (s, g) => stat(g, 'reported_fps'),
     caption: 'Frames each app drew while sampled. Higher is better: the display refreshes at 120 Hz.' },
@@ -78,6 +81,8 @@ const METRICS = [
 ];
 
 let data, scene, tooltip;
+// Whether a metric applies to the selected scene.
+const shown = (m) => (!m.only || m.only === scene.scene) && m.except !== scene.scene;
 
 function niceMax(value) {
   if (!(value > 0)) return 1;
@@ -242,7 +247,7 @@ function tiles() {
 function table() {
   const t = document.getElementById('table');
   t.replaceChildren();
-  const columns = METRICS.filter((m) => (!m.only || m.only === scene.scene) && (m.id !== 'gpu-work' || scene.gpu_trace));
+  const columns = METRICS.filter((m) => shown(m) && (m.id !== 'gpu-work' || scene.gpu_trace));
   const head = el('tr');
   head.append(el('th', {}, 'Mode'), el('th', {}, 'Framework'));
   for (const m of columns) head.append(el('th', {}, `${m.title} (${m.unit})`));
@@ -293,9 +298,9 @@ function render() {
     key.append(swatch, document.createTextNode(data.names[framework]));
     legend.append(key);
   }
-  legend.append(el('small', {}, 'Median of 3 runs · whiskers: min–max'));
+  legend.append(el('small', {}, 'Median of 3 runs (frame pacing: 8) · whiskers: min–max'));
   const charts = document.getElementById('charts');
-  charts.replaceChildren(...METRICS.filter((m) => !m.only || m.only === scene.scene).map(chart).filter(Boolean));
+  charts.replaceChildren(...METRICS.filter(shown).map(chart).filter(Boolean));
   tiles();
   table();
   const run = scene.run;

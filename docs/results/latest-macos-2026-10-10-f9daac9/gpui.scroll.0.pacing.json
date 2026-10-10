@@ -1,0 +1,14 @@
+{
+ "framework": "gpui",
+ "mode": "scroll",
+ "repeat": 0,
+ "display_hz": 120,
+ "frames": 506,
+ "frames_per_second": 63.25,
+ "interval_p50_ms": 18.234,
+ "interval_p95_ms": 28.88,
+ "interval_p99_ms": 29.208,
+ "interval_max_ms": 30.328,
+ "long_intervals": 38,
+ "long_interval_fraction": 0.07525
+}

@@ -1,0 +1,14 @@
+{
+ "framework": "zgui",
+ "mode": "scroll",
+ "repeat": 5,
+ "display_hz": 120,
+ "frames": 499,
+ "frames_per_second": 62.375,
+ "interval_p50_ms": 18.099,
+ "interval_p95_ms": 20.823,
+ "interval_p99_ms": 24.822,
+ "interval_max_ms": 29.573,
+ "long_intervals": 3,
+ "long_interval_fraction": 0.00602
+}

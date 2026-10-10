@@ -29,7 +29,11 @@ process as the target): the window server composites every window, so its
 cost with an app, less the baseline, is what the app adds. After the timed
 trials, pacing trials capture each app's window (scripts/framepace.swift) to
 time the frames it shows; capturing costs the window server work, so they are
-kept apart from the timed trials.
+kept apart from the timed trials. There are eight of those per framework and
+mode: an app's 60 Hz timer lands at a phase of the display's refresh fixed for
+a whole capture, near the window server's latch in some and not others, so
+one capture's 99th-percentile interval swings by 5 ms or more between
+captures, for every framework.
 
 `--powermetrics` also records package and GPU power with `sudo powermetrics`
 (run `sudo -v` first in the same terminal; without cached credentials the
@@ -44,7 +48,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REQUESTED, WARMUP, SAMPLED, INTERVAL = 20, 5, 15, 0.05
-PACING_SECONDS = 8
+PACING_SECONDS, PACING_REPEATS = 8, 8
 MODES = ['idle', 'stream', 'scroll', 'both']
 SCENES = {
     'lab': {
@@ -243,8 +247,8 @@ def main():
                   f"footprint {row['mean_footprint_bytes'] / 2**20:6.1f} MiB ticks {row['workload_ticks']}", flush=True)
             rows.append(row)
             time.sleep(2)
-    for repeat in range(3):
-        order = frameworks[repeat:] + frameworks[:repeat]
+    for repeat in range(PACING_REPEATS):
+        order = frameworks[repeat % len(frameworks):] + frameworks[:repeat % len(frameworks)]
         for mode in [m for m in modes if m != 'idle']:
             for framework in order:
                 row = pacing(args.scene, framework, mode, repeat, out)
@@ -282,7 +286,8 @@ def main():
              'environment': environment(), 'binaries': binaries,
              'protocol': {'requested_seconds': REQUESTED, 'warmup_seconds': WARMUP, 'sampled_seconds': SAMPLED,
                           'interval_seconds': INTERVAL, 'repeats': 3, 'frameworks': frameworks, 'modes': modes,
-                          'pacing_seconds': PACING_SECONDS, 'acceptance_updates_per_second': [58, 61]}}
+                          'pacing_seconds': PACING_SECONDS, 'pacing_repeats': PACING_REPEATS,
+                          'acceptance_updates_per_second': [58, 61]}}
     (out / 'audit.json').write_text(json.dumps(audit, indent=1) + '\n')
     print(('ACCEPTED' if accepted else 'REJECTED'), out)
 
