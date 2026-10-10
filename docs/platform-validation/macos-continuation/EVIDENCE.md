@@ -44,6 +44,7 @@ were moved to `/tmp/zgui-ci-reviewed-raw/`; completed CI-06 is also archived bel
 | [ci-reviewed-07.tar.gz](ci-reviewed-07.tar.gz) | `35811092921` / `46c2c62`: both core jobs and Mac GPU pass; Linux measured-row wheel screenshot differs at a row boundary, though model assertions pass. | CI 06 passed the same probe. Stale presentation versus raster behavior remains unresolved; later steps were not reached and this run failed overall. |
 | [ci-reviewed-08.tar.gz](ci-reviewed-08.tar.gz) | `35811414950` / `cca2ead`: both core jobs and Mac GPU pass; six independent Linux probes fail. | Measured rows, Wayland input/clipboard, editor selection, X11 IME and two Wayland IME groups require follow-up. All independent steps ran; complete failure logs are retained. |
 | [ci-reviewed-09.tar.gz](ci-reviewed-09.tar.gz) | `35812238385` / `7255f67`: three jobs pass; Linux measured rows and three IME groups fail. | Failure diagnostics show the measured initial frame was pre-wheel; later frames converge without making the original probe pass. Clipboard and selection passed unchanged. |
+| [ci-reviewed-10.tar.gz](ci-reviewed-10.tar.gz) | `35813258112` / `16197c6`: three jobs pass; Linux clipboard payload and old synchronous X11 IME fail. | Measured rows, selection and corrected Wayland composition/focus/model/read-only IME probes pass. Clipboard failed 08/10 and passed unchanged 09; its cause remains unresolved. |
 
 `46c2c62` retains all protocol assertions while allowing both `#` and `@`
 object IDs. `cca2ead` also runs independent native checks after unrelated

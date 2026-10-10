@@ -52,6 +52,14 @@ sources and included documentation. Its manifest/diff and repository base remain
 available, but that selective tar alone is not a self-contained build snapshot.
 The corrected harness includes those inputs in subsequent source archives.
 
+Run [10](https://github.com/zeronsh/zgui/actions/runs/35813258112) at `16197c6`
+passed both core jobs and Mac GPU. Linux passed measured rows, editor selection,
+and the corrected native Wayland composition/focus plus external-model/read-only
+IME probes. It still failed the clipboard payload check and the older default
+synchronous X11 IME probe. Clipboard failed in runs 08/10 and passed unchanged
+in 09; its cause remains unresolved. [CI 10](ci-reviewed-10.tar.gz) preserves
+full logs. Later runs 11/12 still require their own final outcomes.
+
 ## Source and CI correction chronology
 
 The latest source is
@@ -92,7 +100,7 @@ that GitHub retained downloadable artifacts.
 | `46c2c62` | Tests-only compatibility with both Wayland debug object-ID separators, keeping all existing protocol assertions. |
 | `cca2ead` | Independent native CI steps continue after unrelated failures while preserving failed job status, so one harness failure does not hide later gate results. |
 | `7255f67` | Reviewed opt-in physical-display fixture and measured-row failure diagnostics; production behavior and assertions unchanged. Run [35812238385](https://github.com/zeronsh/zgui/actions/runs/35812238385) failed, with diagnostics retained in [CI 09](ci-reviewed-09.tar.gz). |
-| `16197c6` | Remaining Wayland IME/burst parser separators accept `#`/`@`, and failure diagnostics retain exact lines. [Run 10](https://github.com/zeronsh/zgui/actions/runs/35813258112) pending. |
+| `16197c6` | Remaining Wayland IME/burst parser separators accept `#`/`@`, and failure diagnostics retain exact lines. [Run 10](https://github.com/zeronsh/zgui/actions/runs/35813258112) failed; [CI 10](ci-reviewed-10.tar.gz) retains the outcome. |
 | `b6639b8` | Measured-row capture waits for exact asserted raster convergence without weakening model/pixel checks. [Run 11](https://github.com/zeronsh/zgui/actions/runs/35813943395) pending. |
 | `4e95c8e` | Owned XIM probe explicitly selects and records supported asynchronous IBus mode; default synchronous limitation remains. [Run 12](https://github.com/zeronsh/zgui/actions/runs/35814061552) pending. |
 

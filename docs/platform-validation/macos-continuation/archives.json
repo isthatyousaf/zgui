@@ -201,5 +201,12 @@
     "sha256": "482c16df6f188e86e963252151c6403754613ce57487eac96fb3cab39fc16b63",
     "bytes": 2029557,
     "files": 207
+  },
+  {
+    "source": "/tmp/zgui-ci-reviewed-raw/ci-reviewed-10",
+    "archive": "ci-reviewed-10.tar.gz",
+    "sha256": "dddd7710e72af33b06616d4b3ff8136e703abb3103370baa0cd7a500e6a3339c",
+    "bytes": 759446,
+    "files": 4
   }
 ]
