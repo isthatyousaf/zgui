@@ -5,8 +5,8 @@
 @group(0) @binding(1) var<storage, read> pixels: array<u32>;
 struct Out { @builtin(position) position: vec4<f32>, @location(0) @interpolate(flat) index: u32 }
 @vertex fn vs(@builtin(vertex_index) v: u32, @builtin(instance_index) i: u32) -> Out {
-  // Bit masks, not a runtime-indexed local array (see draw.wgsl).
-  let corner = vec2(f32((50u >> v) & 1u), f32((44u >> v) & 1u));
+  // A four-vertex strip; corners from bits (see draw.wgsl).
+  let corner = vec2(f32(v & 1u), f32(v >> 1u));
   let r = rects[1u + 2u * i];
   let size = vec2(f32(rects[0].x), f32(rects[0].y));
   let p = vec2(f32(r.x), f32(r.y)) + corner * vec2(f32(r.z), f32(r.w));

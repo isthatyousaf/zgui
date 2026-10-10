@@ -7,6 +7,10 @@ use std::{cell::RefCell, fmt, rc::Rc, sync::Arc};
 use zgui::scene::{Color, NodeId, NodeKind, Rect, Scene};
 
 #[cfg(target_os = "macos")]
+mod layer_present;
+#[cfg(target_os = "macos")]
+mod metal_frame;
+#[cfg(target_os = "macos")]
 mod native_surface;
 mod surface;
 mod upload;
@@ -142,10 +146,14 @@ fn shading(quad: &Quad, scale: f32) -> Shading {
         && quad.options[3] < 0.5
         && quad.rect == quad.fade
         && [x, y, x + width, y + height].into_iter().all(whole);
+    // The basic shader computes what the full one does in the same order,
+    // bit for bit, except for the coverage of a translucent square panel (an
+    // extra divide and multiply): those stay full, so either shader draws the
+    // same bytes.
     let plain = quad.options[0] == 0.
         && quad.options[2] < 0.5
         && quad.shape[2] <= 0.
-        && (quad.shape[3] <= 0.5 || square)
+        && (quad.shape[3] <= 0.5 || (square && quad.color[3] >= 1.))
         && quad.mask[2] <= 0.
         && quad.mask[3] <= 0.;
     if !plain {
@@ -191,20 +199,23 @@ impl QuadPipelines {
         }
     }
 }
-/// Damage regions merge when their union adds at most half their area and
-/// this many device pixels (see `merge_damage`).
-const NEAR_PIXELS: f32 = 256.;
+/// Damage regions merge when their union adds at most half the smaller's
+/// area and this many device pixels (see `merge_damage`): each region costs
+/// its draws again, worth more GPU time than shading a 128×128 square.
+const NEAR_PIXELS: f32 = 16_384.;
 /// Damaged regions of at least this many device pixels draw opaque quads
 /// without blending (see `encode_draws`).
 const SPLIT_PIXELS: f32 = 32_768.;
 /// Split a draw's quads into runs of one shading, in paint order, when
-/// `split`: only software rasterizers gain, running shaders on the CPU. A GPU
-/// shades the full shader almost for free, and each extra draw costs CPU.
+/// `split`. The full shader's size (the registers it holds) slows every pixel
+/// it shades, on a GPU as on a software rasterizer: plain quads (backgrounds,
+/// glyphs, bars) draw with the basic one.
 fn push_draw(draws: &mut Vec<Draw>, quads: &[Quad], draw: Draw, split: bool, scale: f32) {
     if !split || draw.blur.is_some() || draw.layer.is_some() || draw.end <= draw.start {
         draws.push(draw);
         return;
     }
+    // Each run ends where the shading changes, so runs alternate shadings.
     let mut start = draw.start;
     while start < draw.end {
         let kind = shading(&quads[start as usize], scale);
@@ -234,7 +245,12 @@ fn texel_at(texture: &wgpu::Texture, x: u32, y: u32) -> wgpu::TexelCopyTextureIn
 /// contiguous run of paint items free of masks, layers and filters; beneath
 /// it the clip shows a single opaque rectangle (or the window background);
 /// above it nothing paints in the clip outside this frame's damage.
-fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect]) -> bool {
+fn copy_is_exact(
+    scene: &Scene,
+    scroll: &zgui::scene::ScrollMove,
+    damage: &[Rect],
+    scale: f32,
+) -> bool {
     let clip = scroll.clip;
     let items = scene.layer_items_within(None, Some(&[clip]));
     let content = |item: &zgui::scene::PaintItem<'_>| scene.is_within(item.id, scroll.node);
@@ -273,6 +289,21 @@ fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect
     {
         return false;
     }
+    // Content opaque across the whole clip (a list's rows) hides whatever
+    // lies under it, before the move and after.
+    let opaque = |item: &&zgui::scene::PaintItem<'_>| {
+        matches!(item.kind, NodeKind::Quad(quad) | NodeKind::Panel { quad, .. }
+            if quad.fill.3 == 255 && quad.radius <= 0. && quad.shadow.is_none() && quad.decoration.is_none())
+            && item.effects.opacity >= 1.
+            && item.effects.edge_fade <= 0.
+    };
+    if spans_cover(
+        clip,
+        items[first..=last].iter().filter(opaque).filter_map(paints),
+        scale,
+    ) {
+        return true;
+    }
     for item in items[..first].iter().rev() {
         let Some(rect) = paints(item) else {
             continue;
@@ -296,6 +327,33 @@ fn copy_is_exact(scene: &Scene, scroll: &zgui::scene::ScrollMove, damage: &[Rect
         }
     }
     true
+}
+/// Whether rectangles spanning `clip` side to side (or top to bottom) cover
+/// it, meeting on whole device pixels: no seam lets anything beneath show.
+fn spans_cover(clip: Rect, rects: impl Iterator<Item = Rect>, scale: f32) -> bool {
+    let whole = |value: f32| ((value * scale) - (value * scale).round()).abs() < 1e-3;
+    let (mut rows, mut columns) = (Vec::new(), Vec::new());
+    for r in rects {
+        let (right, bottom) = (r.x + r.width, r.y + r.height);
+        if r.x <= clip.x && right >= clip.x + clip.width && whole(r.y) && whole(bottom) {
+            rows.push((r.y, bottom));
+        }
+        if r.y <= clip.y && bottom >= clip.y + clip.height && whole(r.x) && whole(right) {
+            columns.push((r.x, right));
+        }
+    }
+    let covered = |mut spans: Vec<(f32, f32)>, start: f32, end: f32| {
+        spans.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut reach = start;
+        for (from, to) in spans {
+            if from > reach {
+                break;
+            }
+            reach = reach.max(to);
+        }
+        reach >= end
+    };
+    covered(rows, clip.y, clip.y + clip.height) || covered(columns, clip.x, clip.x + clip.width)
 }
 /// Positioned glyphs of laid-out runs; rich text takes each glyph's colour
 /// from its run (it is shaped without colours, see `rich_buffer_raw`).
@@ -473,6 +531,11 @@ struct Deferred {
     disjoint: bool,
     /// Per region, the first quad to draw (see `occluded_from`).
     first: Vec<u32>,
+    /// Draw into the drawable alone, leaving the retained target as it was
+    /// (the next frame then repaints everything): the window changed whole
+    /// this frame and the last, so the target is likely to be repainted whole
+    /// again before any of it is reused. Saves writing every pixel twice.
+    direct: bool,
 }
 /// A backdrop filter's vertical half: one draw per damaged output, reading the
 /// horizontal pass's scratch textures (see `GpuRenderer::blur`).
@@ -623,9 +686,103 @@ struct Retained {
 /// Pipelines writing the retained target and a drawable of `format` at once.
 struct SinglePass {
     format: wgpu::TextureFormat,
-    quads: wgpu::RenderPipeline,
-    clear: wgpu::RenderPipeline,
     copy: wgpu::RenderPipeline,
+    /// Into the next retained target and the drawable.
+    both: PickedPipelines,
+    /// Into the drawable alone (`Deferred::direct`).
+    direct: PickedPipelines,
+}
+/// Presentation through surfaces of the renderer's own (`layer_present`).
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LayerPresent {
+    layer: Option<layer_present::Layer>,
+    /// Surfaces, each with the frame it holds (None: none yet).
+    buffers: Vec<(layer_present::Buffer, Option<u64>)>,
+    /// The surface the layer shows: the last presented frame.
+    shown: Option<usize>,
+    /// The surface the next frame draws into (the retained target).
+    current: Option<usize>,
+    /// Frames presented so far.
+    frame: u64,
+    /// Pixels each recent frame changed, oldest first.
+    history: std::collections::VecDeque<(u64, Vec<Scissor>)>,
+    /// Pixels the frame being drawn changes so far.
+    changed: Vec<Scissor>,
+    /// Regions the current surface takes from the shown one before the
+    /// frame draws (`begin_layer_frame`).
+    catch_up: Vec<Scissor>,
+    /// Frames come at the display's full rate (`GpuRenderer::set_full_rate`):
+    /// a third surface is kept for them.
+    full_rate: bool,
+    /// When the last frame was shown: one soon after it is part of a steady
+    /// run of frames, queued by the layer (`Layer::show`).
+    shown_at: Option<std::time::Instant>,
+}
+#[cfg(target_os = "macos")]
+impl LayerPresent {
+    /// Per surface, whether the layer may still show it: the one on screen
+    /// and any queued after it. Without word from the layer, the two latest.
+    fn busy(&self) -> Vec<bool> {
+        let displayed = self.layer.as_ref().and_then(|layer| layer.displayed());
+        let on_screen = displayed.and_then(|id| {
+            self.buffers
+                .iter()
+                .find(|(buffer, _)| buffer.surface.id() == id)
+                .and_then(|(_, frame)| *frame)
+        });
+        let latest = self.frame;
+        self.buffers
+            .iter()
+            .map(|(_, held)| match (held, on_screen) {
+                (None, _) => false,
+                (Some(held), Some(on_screen)) => *held >= on_screen,
+                (Some(held), None) => held + 2 > latest,
+            })
+            .collect()
+    }
+}
+/// Surfaces a window presents through at most: one on screen, one queued,
+/// and one drawn.
+#[cfg(target_os = "macos")]
+const LAYER_BUFFERS: usize = 3;
+/// Frames of changes kept to bring a surface up to date (older ones copy all).
+#[cfg(target_os = "macos")]
+const LAYER_HISTORY: usize = 8;
+/// A pass's pipelines for each shading, and the one clearing a region.
+struct PickedPipelines {
+    full: wgpu::RenderPipeline,
+    clear: wgpu::RenderPipeline,
+    basic: wgpu::RenderPipeline,
+    opaque: wgpu::RenderPipeline,
+}
+impl PickedPipelines {
+    fn picks(&self) -> Picks<'_> {
+        Picks {
+            full: &self.full,
+            clear: &self.clear,
+            basic: &self.basic,
+            opaque: &self.opaque,
+        }
+    }
+}
+/// Pipelines for each shading, and the one clearing a region (see
+/// `GpuRenderer::encode_damage`).
+#[derive(Clone, Copy)]
+struct Picks<'p> {
+    full: &'p wgpu::RenderPipeline,
+    clear: &'p wgpu::RenderPipeline,
+    basic: &'p wgpu::RenderPipeline,
+    opaque: &'p wgpu::RenderPipeline,
+}
+impl<'p> Picks<'p> {
+    fn get(&self, shading: Shading) -> &'p wgpu::RenderPipeline {
+        match shading {
+            Shading::Full => self.full,
+            Shading::Basic => self.basic,
+            Shading::Opaque => self.opaque,
+        }
+    }
 }
 /// A run of draws encoded as one instanced call.
 struct Batch {
@@ -638,9 +795,15 @@ struct Batch {
 fn quad_bounds(quads: &[Quad]) -> Rect {
     quads
         .iter()
-        .map(|q| Rect::new(q.rect[0], q.rect[1], q.rect[2], q.rect[3]))
+        .map(quad_rect)
         .reduce(|a, b| a.union(b))
         .unwrap_or_default()
+}
+/// A quad's rectangle. Bands of a split panel measure back from its far
+/// edge (`push_panel`): a negative width or height.
+fn quad_rect(quad: &Quad) -> Rect {
+    let [x, y, w, h] = quad.rect;
+    Rect::new(x.min(x + w), y.min(y + h), w.abs(), h.abs())
 }
 /// Shapes using exactly the same font selection and line metrics as the renderer.
 pub fn measure_text(
@@ -715,6 +878,12 @@ impl GpuContext {
             ..Default::default()
         }))
         .map_err(|e| GpuError(e.to_string()))?;
+        // wgpu clears a buffer of its own while creating the device and holds
+        // that command buffer until the first submission. Finish it now, so
+        // it is never alive beside a frame's: Metal keeps memory for as many
+        // command buffers as were ever alive at once, for good.
+        queue.submit([]);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         let (texture_layout, viewport_layout, quad_shader, quad_layout) =
             create_quad_pipelines(&device);
         let quads = QuadPipelines {
@@ -771,7 +940,7 @@ pub struct GpuRenderer {
     pending: RefCell<Option<wgpu::CommandEncoder>>,
     /// Viewport uniforms by logical size (f32 bits). Each is written once at
     /// creation; layers and the window switch between them per pass.
-    viewports: FxHashMap<(u32, u32), wgpu::BindGroup>,
+    viewports: FxHashMap<(u32, u32, u32), wgpu::BindGroup>,
     /// The raster each canvas, decoration or SVG node currently draws. A
     /// resized or restyled node gets a new raster; the old texture goes at
     /// once instead of waiting for a structural prune.
@@ -822,6 +991,8 @@ pub struct GpuRenderer {
     copy_present: bool,
     /// Frames whose damage was drawn by `present_single_pass`.
     single_pass_frames: u64,
+    /// Frames presented to the drawable alone (`Deferred::direct`).
+    direct_frames: u64,
     /// Work encoded at presentation (single-pass frames), reported with the
     /// next `render`'s statistics.
     present_stats: GpuStats,
@@ -846,6 +1017,8 @@ pub struct GpuRenderer {
     shapes: FxHashMap<NodeId, Shaped>,
     shaped_bytes: usize,
     fresh: bool,
+    /// Consecutive presented frames whose damage covered the window.
+    whole_frames: u32,
     /// The scene flush the retained target was last rendered from.
     rendered_serial: Option<u64>,
     /// Scroll copies for the next root frame: destination pixel rectangle
@@ -856,6 +1029,8 @@ pub struct GpuRenderer {
     vertices: wgpu::Buffer,
     vertex_capacity: usize,
     frame_quads: Vec<Quad>,
+    /// The frame's draws, kept for their allocation.
+    frame_draws: Vec<Draw>,
     background: Color,
     images: FxHashMap<u64, (wgpu::BindGroup, usize)>,
     #[cfg(target_os = "macos")]
@@ -867,6 +1042,22 @@ pub struct GpuRenderer {
     /// `widen_drawables`).
     #[cfg(target_os = "macos")]
     wide_until: Option<std::time::Instant>,
+    /// Presentation through surfaces of the renderer's own (layer_present.rs).
+    #[cfg(target_os = "macos")]
+    layer_present: Option<LayerPresent>,
+    /// Pipelines for frames encoded with Metal directly (`render_direct`);
+    /// `None` inside if they could not be built.
+    #[cfg(target_os = "macos")]
+    metal_frame: std::cell::OnceCell<Option<metal_frame::MetalFrame>>,
+    /// A directly encoded frame, committed, until it is known complete.
+    #[cfg(target_os = "macos")]
+    metal_inflight: RefCell<Option<metal_frame::CommandBuffer>>,
+    /// The viewport uniform `select_viewport` chose last, for direct frames.
+    #[cfg(target_os = "macos")]
+    viewport_values: [f32; 4],
+    /// Shifted texel copies drawn in a render pass (copy_offset.wgsl).
+    #[cfg(target_os = "macos")]
+    copy_offset: Option<wgpu::RenderPipeline>,
     canvases: canvas::CanvasCache,
     svgs: svg::SvgCache,
     /// Small untransformed SVG rasters packed into the glyph atlas by image
@@ -986,14 +1177,37 @@ impl GpuRenderer {
         let copy_present = config
             .as_ref()
             .is_some_and(|c| c.usage.contains(wgpu::TextureUsages::COPY_DST));
+        // A window on macOS presents surfaces of its own (see `LayerPresent`).
+        let layer_presenting =
+            cfg!(target_os = "macos") && config.is_some() && info.backend == wgpu::Backend::Metal;
         // Single-pass presentation writes the drawable in a non-sRGB format,
         // storing the retained target's bytes unchanged, exactly what the
         // present blit produces for opaque pixels.
-        let single_pass_format = config.as_ref().map(|c| c.format.remove_srgb_suffix());
-        let target = texture(&device, width, height, "retained output");
+        let single_pass_format = config
+            .as_ref()
+            .filter(|_| !layer_presenting)
+            .map(|c| c.format.remove_srgb_suffix());
+        // Presenting surfaces of its own, each frame draws into one of them
+        // (`begin_layer_frame`): a window-sized target would only be dropped,
+        // and the driver keeps the memory it held.
+        let target = if layer_presenting {
+            texture(&device, 1, 1, "retained output placeholder")
+        } else {
+            texture(&device, width, height, "retained output")
+        };
         let view = target.create_view(&Default::default());
-        let atlas = texture(&device, 1, 1, "lazy glyph atlas placeholder");
-        let split_shading = context.inner.info.device_type == wgpu::DeviceType::Cpu;
+        #[cfg(target_os = "macos")]
+        if !layer_presenting {
+            written(&device, &queue, &view);
+        }
+        let atlas = sampled_texture(
+            &device,
+            context.inner.mapped_uploads,
+            1,
+            1,
+            "lazy glyph atlas placeholder",
+        );
+        let split_shading = true;
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas"),
             layout: &context.inner.texture_layout,
@@ -1013,8 +1227,11 @@ impl GpuRenderer {
             ],
         });
         let present_unpremultiplies = config.as_ref().is_some_and(unpremultiplies);
+        // Presenting surfaces of its own, the target is never blitted (and a
+        // blit bind group would keep the first one alive).
         let blit = config
             .as_ref()
+            .filter(|_| !layer_presenting)
             .map(|c| blit_pipeline(&device, c.format, unpremultiplies(c)));
         let blit_bind = blit.as_ref().map(|p| blit_group(&device, p, &view));
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1035,7 +1252,7 @@ impl GpuRenderer {
             mapped: context
                 .inner
                 .mapped_uploads
-                .then(|| RefCell::new(upload::MappedRing::new(&device))),
+                .then(|| RefCell::new(upload::MappedRing::new(&device, &queue))),
             texture_uploads: Default::default(),
             instance,
             window,
@@ -1060,10 +1277,21 @@ impl GpuRenderer {
             deferred: RefCell::new(None),
             single_pass: None,
             single_pass_format,
+            #[cfg(target_os = "macos")]
+            layer_present: layer_presenting.then(LayerPresent::default),
+            #[cfg(target_os = "macos")]
+            metal_frame: Default::default(),
+            #[cfg(target_os = "macos")]
+            metal_inflight: RefCell::new(None),
+            #[cfg(target_os = "macos")]
+            viewport_values: [0.; 4],
+            #[cfg(target_os = "macos")]
+            copy_offset: None,
             in_layer: false,
             present_unpremultiplies,
             copy_present,
             single_pass_frames: 0,
+            direct_frames: 0,
             present_stats: GpuStats::default(),
             atlas,
             atlas_size: 1,
@@ -1077,6 +1305,7 @@ impl GpuRenderer {
             shapes: FxHashMap::default(),
             shaped_bytes: 0,
             fresh: true,
+            whole_frames: 0,
             rendered_serial: None,
             copies: Vec::new(),
             atlas_epoch: 1,
@@ -1084,6 +1313,7 @@ impl GpuRenderer {
             vertices,
             vertex_capacity: 4096,
             frame_quads: Vec::new(),
+            frame_draws: Vec::new(),
             background: Color(0, 0, 0, 0),
             images: FxHashMap::default(),
             #[cfg(target_os = "macos")]
@@ -1212,6 +1442,7 @@ impl GpuRenderer {
         };
         if self.scale != scale {
             self.flush_pending();
+            self.release_atlas_cells();
             self.scale = scale;
             self.layers.clear();
             self.shapes.clear();
@@ -1225,6 +1456,12 @@ impl GpuRenderer {
         let (width, height) = (width.max(1), height.max(1));
         if (width, height) == (self.width, self.height) {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(present) = &mut self.layer_present {
+            present.current = None;
+            present.changed.clear();
+            present.catch_up.clear();
         }
         self.flush_pending();
         self.layers.clear();
@@ -1240,8 +1477,18 @@ impl GpuRenderer {
         self.height = height;
         self.spare = None;
         self.target_copy_bind = None;
-        self.target = texture(&self.device, width, height, "retained output");
+        // A surface of the layer's becomes the target (`begin_layer_frame`).
+        let (target_width, target_height) = if self.layer_present.is_some() {
+            (1, 1)
+        } else {
+            (width, height)
+        };
+        self.target = texture(&self.device, target_width, target_height, "retained output");
         self.view = self.target.create_view(&Default::default());
+        #[cfg(target_os = "macos")]
+        if self.layer_present.is_none() {
+            written(&self.device, &self.queue, &self.view);
+        }
         if let (Some(s), Some(c)) = (&self.surface, &mut self.config) {
             c.width = width;
             c.height = height;
@@ -1260,6 +1507,26 @@ impl GpuRenderer {
             .as_ref()
             .map(|p| blit_group(&self.device, p, &self.view));
         self.fresh = true;
+    }
+    /// Render as `render`, without counting `damage` among what the frame
+    /// changed: a repaint for comparison (`ZGUI_DAMAGE_CHECK`) must leave
+    /// later frames to bring their surfaces up to date as they otherwise would.
+    pub fn render_uncounted(
+        &mut self,
+        scene: &Scene,
+        damage: &[Rect],
+    ) -> Result<GpuStats, GpuError> {
+        #[cfg(target_os = "macos")]
+        let changed = self
+            .layer_present
+            .as_ref()
+            .map(|present| present.changed.clone());
+        let stats = self.render(scene, damage);
+        #[cfg(target_os = "macos")]
+        if let (Some(present), Some(changed)) = (self.layer_present.as_mut(), changed) {
+            present.changed = changed;
+        }
+        stats
     }
     pub fn render(&mut self, scene: &Scene, damage: &[Rect]) -> Result<GpuStats, GpuError> {
         let presented = std::mem::take(&mut self.present_stats);
@@ -1347,10 +1614,11 @@ impl GpuRenderer {
             self.width as f32 / self.scale,
             self.height as f32 / self.scale,
         );
-        let items = if self.fresh || scene.has_backdrop_blur() {
-            scene.layer_items(None)
-        } else {
-            scene.layer_items_within(None, Some(&merge_damage(damage, viewport, self.scale)))
+        let merged = (!self.fresh && !scene.has_backdrop_blur())
+            .then(|| merge_damage(damage, viewport, self.scale));
+        let items = match &merged {
+            Some(regions) => scene.layer_items_within(None, Some(regions)),
+            None => scene.layer_items(None),
         };
         let mut layer_stats = GpuStats::default();
         for item in &items {
@@ -1358,7 +1626,7 @@ impl GpuRenderer {
                 self.prepare_layer(scene, item.id, &mut layer_stats)?;
             }
         }
-        let mut stats = self.render_flat(scene, items, damage)?;
+        let mut stats = self.render_flat(scene, items, damage, merged)?;
         self.rendered_serial = Some(scene.flush_serial());
         stats.layer_repaints = layer_stats.layer_repaints;
         stats.layer_cache_hits = layer_stats.layer_cache_hits;
@@ -1526,6 +1794,7 @@ impl GpuRenderer {
             scene,
             local,
             &[Rect::new(0., 0., bounds.width, bounds.height)],
+            None,
         );
         self.in_layer = in_layer;
         self.layer_origin = old_origin;
@@ -1564,7 +1833,7 @@ impl GpuRenderer {
         Ok(())
     }
     fn select_viewport(&mut self, width: f32, height: f32) {
-        let key = (width.to_bits(), height.to_bits());
+        let key = (width.to_bits(), height.to_bits(), self.scale.to_bits());
         if !self.viewports.contains_key(&key) {
             // Layer sizes come and go; keep the map small.
             if self.viewports.len() >= 32 {
@@ -1574,7 +1843,8 @@ impl GpuRenderer {
                 &self.device,
                 self.mapped.is_some(),
                 "viewport",
-                bytemuck::cast_slice(&[width, height, 0., 0.]),
+                // Logical size, and device pixels per logical pixel.
+                bytemuck::cast_slice(&[width, height, self.scale, 0.]),
                 wgpu::BufferUsages::UNIFORM,
             );
             let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1588,6 +1858,10 @@ impl GpuRenderer {
             self.viewports.insert(key, bind);
         }
         self.viewport_bind = self.viewports.get(&key).cloned();
+        #[cfg(target_os = "macos")]
+        {
+            self.viewport_values = [width, height, self.scale, 0.];
+        }
     }
     fn texture_bind(&self, view: &wgpu::TextureView, label: &str) -> wgpu::BindGroup {
         self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1611,11 +1885,13 @@ impl GpuRenderer {
             ],
         })
     }
+    /// `merged`: `damage` merged into regions already (`merge_damage`).
     fn render_flat(
         &mut self,
         _scene: &Scene,
         items: Vec<zgui::scene::PaintItem<'_>>,
         damage: &[Rect],
+        merged: Option<Vec<Rect>>,
     ) -> Result<GpuStats, GpuError> {
         let mut stats = GpuStats::default();
         let copies = if self.in_layer || self.fresh {
@@ -1635,6 +1911,14 @@ impl GpuRenderer {
             self.height as f32 / self.scale,
         );
         self.select_viewport(viewport.width, viewport.height);
+        // Whether the scene's own damage covers the window (not a repaint
+        // forced by a stale target): see `Deferred::direct`.
+        let whole = damage.iter().any(|d| {
+            d.x <= 0.
+                && d.y <= 0.
+                && d.x + d.width >= viewport.width
+                && d.y + d.height >= viewport.height
+        });
         let has_blur = items
             .iter()
             .any(|item| item.effects.opacity > 0. && item.effects.blur_radius > 0.);
@@ -1658,7 +1942,7 @@ impl GpuRenderer {
                 .collect();
             blur_damage(damage, &dependencies, viewport, self.scale)
         } else {
-            merge_damage(damage, viewport, self.scale)
+            merged.unwrap_or_else(|| merge_damage(damage, viewport, self.scale))
         };
         if damage.is_empty() && copies.is_empty() {
             return Ok(stats);
@@ -1672,6 +1956,7 @@ impl GpuRenderer {
             if thrashing && self.atlas_size < MAX_ATLAS && self.entries.len() < 8192 {
                 self.reset_atlas((self.atlas_size * 2).min(MAX_ATLAS));
             } else {
+                self.release_atlas_cells();
                 self.entries.clear();
                 self.image_cells.clear();
                 self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
@@ -1691,7 +1976,8 @@ impl GpuRenderer {
             border: [0.; 4],
             mask: NO_MASK,
         });
-        let mut draws = Vec::new();
+        let mut draws = std::mem::take(&mut self.frame_draws);
+        draws.clear();
         for item in items {
             // Retained hidden subtrees must not allocate textures, shape text,
             // or trigger filters until their effective opacity is visible.
@@ -1870,21 +2156,26 @@ impl GpuRenderer {
                         if let Some(old) = self.node_images.remove(&item.id) {
                             self.images.remove(&old);
                         }
-                        quads.push(Quad {
-                            rect: fade,
-                            uv: [0.; 4],
-                            color: rgba(fill, item.effects.opacity),
-                            fade,
-                            options: [item.effects.edge_fade, 0., 0., 1.],
-                            shape: [0., 0., 0., 1.],
-                            border: decoration::shadow_corners(
-                                style,
-                                bounds.width,
-                                bounds.height,
-                                0.,
-                            ),
-                            mask: NO_MASK,
-                        });
+                        push_panel(
+                            &mut quads,
+                            Quad {
+                                rect: fade,
+                                uv: [0.; 4],
+                                color: rgba(fill, item.effects.opacity),
+                                fade,
+                                options: [item.effects.edge_fade, 0., 0., 1.],
+                                shape: [0., 0., 0., 1.],
+                                border: decoration::shadow_corners(
+                                    style,
+                                    bounds.width,
+                                    bounds.height,
+                                    0.,
+                                ),
+                                mask: NO_MASK,
+                            },
+                            self.scale,
+                            self.split_shading,
+                        );
                     } else if style.decoration.is_some() && bounds.width > 0. && bounds.height > 0.
                     {
                         let before = self.canvases.rasterizations();
@@ -1906,16 +2197,21 @@ impl GpuRenderer {
                             mask: NO_MASK,
                         });
                     } else {
-                        quads.push(Quad {
-                            rect: fade,
-                            uv: [0.; 4],
-                            color: rgba(style.fill, item.effects.opacity),
-                            fade,
-                            options: [item.effects.edge_fade, 0., 0., 0.],
-                            shape: [style.radius.max(0.), style.border_width.max(0.), 0., 1.],
-                            border: rgba(style.border_color, item.effects.opacity),
-                            mask: NO_MASK,
-                        });
+                        push_panel(
+                            &mut quads,
+                            Quad {
+                                rect: fade,
+                                uv: [0.; 4],
+                                color: rgba(style.fill, item.effects.opacity),
+                                fade,
+                                options: [item.effects.edge_fade, 0., 0., 0.],
+                                shape: [style.radius.max(0.), style.border_width.max(0.), 0., 1.],
+                                border: rgba(style.border_color, item.effects.opacity),
+                                mask: NO_MASK,
+                            },
+                            self.scale,
+                            self.split_shading,
+                        );
                     }
                 }
                 NodeKind::Svg(svg) => {
@@ -2186,13 +2482,10 @@ impl GpuRenderer {
                                 item.text_options,
                             ))
                         } else {
-                            let mut b = Buffer::new(
-                                &mut fonts,
-                                Metrics::new(
-                                    font_size.max(1.),
-                                    item.font.line_height.resolve(font_size),
-                                ),
-                            );
+                            let mut b = Buffer::new_empty(Metrics::new(
+                                font_size.max(1.),
+                                item.font.line_height.resolve(font_size),
+                            ));
                             b.set_size(Some(bounds.width), Some(bounds.height));
                             text::set_buffer_text(
                                 &mut fonts,
@@ -2371,18 +2664,85 @@ impl GpuRenderer {
                 push_draw(&mut draws, &quads, draw, self.split_shading, self.scale);
             }
         }
+        // The surface this frame draws into, when presenting through the
+        // layer: shown surfaces stay as they are.
+        #[cfg(target_os = "macos")]
+        let shown = if self.in_layer {
+            None
+        } else {
+            self.begin_layer_frame(self.fresh || whole)?;
+            self.layer_present
+                .as_ref()
+                .and_then(|present| present.shown)
+        };
+        #[cfg(not(target_os = "macos"))]
+        let shown: Option<usize> = None;
+        let regions: Vec<(Rect, (u32, u32, u32, u32))> = damage
+            .iter()
+            .filter_map(|region| {
+                scissor(*region, self.scale, self.width, self.height).map(|s| (*region, s))
+            })
+            .collect();
+        for (_, (_, _, w, h)) in &regions {
+            stats.damaged_pixels += u64::from(*w) * u64::from(*h);
+        }
+        // What this frame changes in the retained target, for surfaces that
+        // must catch up later (`begin_layer_frame`).
+        #[cfg(target_os = "macos")]
+        if !self.in_layer
+            && let Some(present) = &mut self.layer_present
+        {
+            present.changed.extend(regions.iter().map(|(_, s)| *s));
+            present.changed.extend(copies.iter().map(|(s, _)| *s));
+        }
+        // What the surface lacks: changes since it was last shown that this
+        // frame doesn't repaint, and scrolled content; both drawn from the
+        // shown surface at the start of the frame's first pass, as instances
+        // after the frame's quads.
+        #[cfg(target_os = "macos")]
+        let mut catch_up = shown.and_then(|shown| {
+            let (bind, draws) = self.catch_up_draws(shown, &copies, &regions)?;
+            stats.scroll_copies += copies.len();
+            let start = quads.len() as u32;
+            quads.extend(draws.into_iter().map(|((x, y, w, h), (dx, dy))| Quad {
+                rect: [x as f32, y as f32, w as f32, h as f32],
+                uv: [dx as f32, dy as f32, 0., 0.],
+                ..bytemuck::Zeroable::zeroed()
+            }));
+            Some((bind, start..quads.len() as u32))
+        });
         let needed = quads.len() * std::mem::size_of::<Quad>();
         if needed > VERTEX_BUDGET {
             return Err(GpuError("frame geometry exceeds 32 MiB budget".into()));
+        }
+        // Plain frames (no filters, images or layers, nothing else recorded)
+        // skip wgpu: see `metal_frame`.
+        #[cfg(target_os = "macos")]
+        if !self.in_layer
+            && !has_blur
+            && self.mapped.is_some()
+            && self.texture_uploads.is_empty()
+            && self.pending.get_mut().is_none()
+            && (shown.is_some() || copies.is_empty())
+            && (self.layer_present.is_some() || self.surface.is_none())
+            && self.single_pass_format.is_none()
+            && draws
+                .iter()
+                .all(|draw| draw.image.is_none() && draw.layer.is_none())
+            && self
+                .metal_frame
+                .get_or_init(|| metal_frame::MetalFrame::new(&self.device, &self.queue).ok())
+                .is_some()
+        {
+            let catch_up = catch_up.map(|(_, instances)| instances);
+            return Ok(self.render_direct(quads, draws, &regions, catch_up, shown, stats));
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Glyphs rasterized while building this frame land before any pass
         // samples them. Counted as glyph uploads, not scene render passes.
         self.texture_uploads.encode(&self.device, &mut encoder);
-        // Scrolled content: shift last frame's pixels (through the spare
-        // target, as a texture cannot copy onto itself), then draw only what
-        // the shift could not supply.
-        if !copies.is_empty() {
+        // Scrolled with surfaces of its own, the copies are drawn below.
+        if shown.is_none() && !copies.is_empty() {
             let spare = self.spare_texture();
             for ((x, y, w, h), (sx, sy)) in &copies {
                 let extent = wgpu::Extent3d {
@@ -2449,16 +2809,6 @@ impl GpuRenderer {
                     })
                 })
             });
-        let regions: Vec<(Rect, (u32, u32, u32, u32))> = damage
-            .iter()
-            .filter_map(|region| {
-                scissor(*region, self.scale, self.width, self.height).map(|s| (*region, s))
-            })
-            .collect();
-        for (_, (_, _, w, h)) in &regions {
-            stats.damaged_pixels += u64::from(*w) * u64::from(*h);
-        }
-
         // The part of a filter's output inside `region`, if it reaches it.
         let filtered = |draw: &Draw, region: &Rect| {
             let (bounds, _) = draw.blur?;
@@ -2495,21 +2845,33 @@ impl GpuRenderer {
             && self.single_pass_format.is_some()
             && !self.copy_present
             && copies.is_empty();
+        if !defer && !self.in_layer {
+            // Drawn into the target now: no streak of drawable-only frames.
+            self.whole_frames = 0;
+        }
         let mut from = 0;
         // Each filter's vertical half opens the pass after its horizontal one.
         let mut vertical = None;
         for (segment, end) in splits.iter().copied().chain([draws.len()]).enumerate() {
             if defer && end == draws.len() {
                 stats.render_passes += 1;
+                let blur = vertical.take();
+                let direct = whole && self.whole_frames > 0 && segment == 0 && blur.is_none();
+                self.whole_frames = if whole {
+                    self.whole_frames.saturating_add(1)
+                } else {
+                    0
+                };
                 *self.deferred.get_mut() = Some(Deferred {
                     vertices: vertices.clone(),
                     draws: draws.split_off(from),
                     regions,
                     viewport: self.viewport_bind.clone(),
-                    blur: vertical.take(),
+                    blur,
                     clear: segment == 0,
                     disjoint: !has_blur,
                     first,
+                    direct,
                 });
                 break;
             }
@@ -2528,6 +2890,14 @@ impl GpuRenderer {
                     })],
                     ..Default::default()
                 });
+                #[cfg(target_os = "macos")]
+                if let Some((bind, instances)) = catch_up.take() {
+                    pass.set_pipeline(self.copy_offset.as_ref().expect("made with the draws"));
+                    pass.set_bind_group(0, &bind, &[]);
+                    pass.set_vertex_buffer(0, vertices.slice(..));
+                    pass.draw(0..4, instances);
+                    stats.draw_calls += 1;
+                }
                 if let Some(blur) = vertical.take() {
                     let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
                     Self::encode_vertical(&mut pass, pipeline, &blur, &mut stats);
@@ -2542,7 +2912,7 @@ impl GpuRenderer {
                     if segment == 0 && first == 0 {
                         pass.set_pipeline(quads.clear(self.split_shading));
                         pass.set_bind_group(0, &self.bind, &[]);
-                        pass.draw(0..6, 0..1);
+                        pass.draw(0..4, 0..1);
                         stats.draw_calls += 1;
                     }
                     self.encode_draws(
@@ -2574,7 +2944,102 @@ impl GpuRenderer {
         *self.pending.get_mut() = Some(encoder);
         self.fresh = false;
         self.frame_quads = quads;
+        draws.clear();
+        self.frame_draws = draws;
         Ok(stats)
+    }
+    /// Record this frame with Metal directly (`metal_frame`): the pass the
+    /// wgpu path records for a frame of plain draws, committed at once.
+    #[cfg(target_os = "macos")]
+    fn render_direct(
+        &mut self,
+        quads: Vec<Quad>,
+        mut draws: Vec<Draw>,
+        regions: &[(Rect, Scissor)],
+        catch_up: Option<std::ops::Range<u32>>,
+        shown: Option<usize>,
+        mut stats: GpuStats,
+    ) -> GpuStats {
+        let vertices = {
+            use objc2::Message;
+            let mapped = self.mapped.as_mut().expect("checked by the caller").get_mut();
+            let (_, allocated) = mapped.write(bytemuck::cast_slice(&quads));
+            stats.vertex_buffer_allocations += usize::from(allocated);
+            self.vertex_capacity = mapped.bytes();
+            mapped.last_metal().retain()
+        };
+        self.whole_frames = 0;
+        let first = occluded_from(&quads, &draws, regions, self.scale);
+        let committed = {
+            let frame = self
+                .metal_frame
+                .get()
+                .and_then(Option::as_ref)
+                .expect("checked by the caller");
+            // Metal's textures, each HAL guard dropped before the next is
+            // taken (wgpu's lock is not reentrant).
+            let raw = |texture: &wgpu::Texture| {
+                use objc2::Message;
+                // SAFETY: The HAL guard only borrows this live texture.
+                unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }
+                    .expect("a Metal texture")
+                    .raw_handle()
+                    .retain()
+            };
+            // The retained target: through the layer, this frame's surface.
+            let (target, atlas) = (raw(&self.target), raw(&self.atlas));
+            let mut pass = frame.begin(&target, &vertices, self.viewport_values);
+            let present = self.layer_present.as_ref();
+            if let (Some(instances), Some(present), Some(shown)) = (catch_up, present, shown) {
+                pass.texture(&present.buffers[shown].0.metal);
+                pass.copies(frame, instances);
+                stats.draw_calls += 1;
+            }
+            pass.texture(&atlas);
+            let clear = if self.split_shading {
+                Shading::Basic
+            } else {
+                Shading::Full
+            };
+            for (index, (region, region_scissor)) in regions.iter().enumerate() {
+                pass.scissor(*region_scissor);
+                if first[index] == 0 {
+                    pass.quads(frame, clear, true, 0..1);
+                    stats.draw_calls += 1;
+                }
+                self.batches(*region, &draws, first[index], |batch| {
+                    let Some(rect) = scissor(batch.rect, self.scale, self.width, self.height)
+                    else {
+                        return;
+                    };
+                    pass.scissor(rect);
+                    pass.quads(frame, batch.shading, false, batch.start..batch.end);
+                    stats.draw_calls += 1;
+                    stats.instances += (batch.end - batch.start) as usize;
+                });
+            }
+            pass.commit()
+        };
+        *self.metal_inflight.get_mut() = Some(committed);
+        stats.render_passes += 1;
+        self.fresh = false;
+        self.frame_quads = quads;
+        draws.clear();
+        self.frame_draws = draws;
+        stats
+    }
+    /// Wait for a directly encoded frame (`render_direct`) to complete.
+    #[cfg(target_os = "macos")]
+    fn finish_direct(&self) -> bool {
+        use objc2_metal::MTLCommandBuffer;
+        let Some(buffer) = self.metal_inflight.borrow_mut().take() else {
+            return false;
+        };
+        buffer.waitUntilCompleted();
+        if let Some(mapped) = &self.mapped {
+            mapped.borrow_mut().completed();
+        }
+        true
     }
     /// The spare retained texture (single-pass presentation's other target),
     /// created at the window's size if needed.
@@ -2606,9 +3071,17 @@ impl GpuRenderer {
         let mut copies = Vec::new();
         let mut repaint = Vec::new();
         // On Apple GPUs a process's first texture blit makes the driver hold
-        // over 100 MB of graphics memory (see vendor/wgpu-hal/ZGUI_PATCH.md),
-        // and redrawing a scrolled view costs the GPU little. Repaint there.
-        let copyable = !cfg!(target_os = "macos");
+        // over 100 MB of graphics memory (see vendor/wgpu-hal/ZGUI_PATCH.md):
+        // repaint there, unless presenting surfaces of its own, which copy
+        // by drawing from the shown surface. That holds the previous flush
+        // only once it was presented.
+        #[cfg(target_os = "macos")]
+        let copyable = self
+            .layer_present
+            .as_ref()
+            .is_some_and(|present| present.current.is_none());
+        #[cfg(not(target_os = "macos"))]
+        let copyable = true;
         for scroll in scene.scroll_moves() {
             if scroll.serial != serial {
                 continue;
@@ -2643,7 +3116,7 @@ impl GpuRenderer {
                     if copyable
                         && !self.fresh
                         && self.rendered_serial == Some(serial - 1)
-                        && copy_is_exact(scene, scroll, damage) =>
+                        && copy_is_exact(scene, scroll, damage, self.scale) =>
                 {
                     copies.push(copy)
                 }
@@ -2654,6 +3127,8 @@ impl GpuRenderer {
     }
     /// Submit commands recorded by the last render, if any.
     fn flush_pending(&self) {
+        #[cfg(target_os = "macos")]
+        self.finish_direct();
         let Some(mut pending) = self.pending.borrow_mut().take() else {
             return;
         };
@@ -2678,15 +3153,14 @@ impl GpuRenderer {
                 let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
                 Self::encode_vertical(&mut pass, pipeline, blur, &mut stats);
             }
-            self.encode_damage(
-                &mut pass,
-                &deferred,
-                (
-                    self.context.inner.quads.clear(false),
-                    self.context.inner.quads.get(Shading::Full),
-                ),
-                &mut stats,
-            );
+            let quads = &self.context.inner.quads;
+            let picks = Picks {
+                full: quads.get(Shading::Full),
+                clear: quads.clear(false),
+                basic: quads.get(Shading::Basic),
+                opaque: quads.get(Shading::Opaque),
+            };
+            self.encode_damage(&mut pass, &deferred, picks, &mut stats);
         }
         self.queue.submit([pending.finish()]);
         self.belt.borrow_mut().recall();
@@ -2706,20 +3180,14 @@ impl GpuRenderer {
         &self,
         pass: &mut wgpu::RenderPass<'_>,
         frame: &Deferred,
-        (clear, quads): (&wgpu::RenderPipeline, &wgpu::RenderPipeline),
+        picks: Picks<'_>,
         stats: &mut GpuStats,
     ) {
         pass.set_vertex_buffer(0, frame.vertices.slice(..));
         pass.set_bind_group(0, &self.bind, &[]);
         pass.set_bind_group(1, frame.viewport.as_ref(), &[]);
-        // The full shader draws every shading; unblended ones clear.
-        let pick = |shading| {
-            if shading == Shading::Opaque {
-                clear
-            } else {
-                quads
-            }
-        };
+        let (clear, quads) = (picks.clear, picks.full);
+        let pick = |shading| picks.get(shading);
         let first = |index: usize| frame.first.get(index).copied().unwrap_or(0);
         if !frame.clear {
             pass.set_pipeline(quads);
@@ -2736,7 +3204,7 @@ impl GpuRenderer {
             for (index, (_, (x, y, w, h))) in frame.regions.iter().enumerate() {
                 if first(index) == 0 {
                     pass.set_scissor_rect(*x, *y, *w, *h);
-                    pass.draw(0..6, 0..1);
+                    pass.draw(0..4, 0..1);
                     stats.draw_calls += 1;
                 }
             }
@@ -2751,7 +3219,7 @@ impl GpuRenderer {
             if first(index) == 0 {
                 pass.set_pipeline(clear);
                 pass.set_bind_group(0, &self.bind, &[]);
-                pass.draw(0..6, 0..1);
+                pass.draw(0..4, 0..1);
                 stats.draw_calls += 1;
             }
             pass.set_pipeline(quads);
@@ -2804,26 +3272,92 @@ impl GpuRenderer {
             if let Some(spare) = &mut self.spare {
                 spare.copy_bind = None;
             }
+            let both = |blend, basic| {
+                quad_pipeline(
+                    &self.device,
+                    &inner.quad_shader,
+                    &inner.quad_layout,
+                    blend,
+                    Some(format),
+                    basic,
+                )
+            };
+            let direct = |blend, basic| {
+                drawable_pipeline(
+                    &self.device,
+                    &inner.quad_shader,
+                    &inner.quad_layout,
+                    blend,
+                    format,
+                    basic,
+                )
+            };
             self.single_pass = Some(SinglePass {
                 format,
-                quads: quad_pipeline(
-                    &self.device,
-                    &inner.quad_shader,
-                    &inner.quad_layout,
-                    true,
-                    Some(format),
-                    false,
-                ),
-                clear: quad_pipeline(
-                    &self.device,
-                    &inner.quad_shader,
-                    &inner.quad_layout,
-                    false,
-                    Some(format),
-                    false,
-                ),
                 copy,
+                both: PickedPipelines {
+                    full: both(true, false),
+                    clear: both(false, false),
+                    basic: both(true, true),
+                    opaque: both(false, true),
+                },
+                direct: PickedPipelines {
+                    full: direct(true, false),
+                    clear: direct(false, false),
+                    basic: direct(true, true),
+                    opaque: direct(false, true),
+                },
             });
+        }
+        if !frame.regions.is_empty() {
+            self.single_pass_frames += 1;
+        }
+        let clear = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        };
+        let attachment = |view| {
+            Some(wgpu::RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: clear,
+            })
+        };
+        // A frame that clears and redraws the whole target keeps none of the
+        // last one: nothing is copied, so it is drawn into the target itself
+        // (or the drawable alone, `direct`) and needs no spare.
+        let redrawn = frame.clear
+            && frame.regions.iter().any(|(_, (x, y, w, h))| {
+                (*x, *y) == (0, 0) && *w >= self.width && *h >= self.height
+            });
+        if frame.direct || redrawn {
+            let pipelines = self.single_pass.as_ref().expect("created above");
+            let mut stats = GpuStats::default();
+            {
+                let both = [attachment(&self.view), attachment(output)];
+                let alone = [attachment(output)];
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("frame"),
+                    color_attachments: if frame.direct { &alone } else { &both },
+                    ..Default::default()
+                });
+                let picks = if frame.direct {
+                    pipelines.direct.picks()
+                } else {
+                    pipelines.both.picks()
+                };
+                self.encode_damage(&mut pass, frame, picks, &mut stats);
+            }
+            self.present_stats.draw_calls += stats.draw_calls;
+            self.present_stats.instances += stats.instances;
+            if frame.direct {
+                // The target still holds an earlier frame: the next render
+                // repaints everything.
+                self.fresh = true;
+                self.direct_frames += 1;
+            }
+            return;
         }
         if self
             .spare
@@ -2850,27 +3384,10 @@ impl GpuRenderer {
             .get_or_insert_with(|| blit_group(&self.device, &pipelines.copy, &self.view))
             .clone();
         let spare = self.spare.take().expect("created above");
-        let clear = wgpu::Operations {
-            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-            store: wgpu::StoreOp::Store,
-        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame"),
-                color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &spare.view,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: clear,
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: output,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: clear,
-                    }),
-                ],
+                color_attachments: &[attachment(&spare.view), attachment(output)],
                 ..Default::default()
             });
             pass.set_pipeline(&pipelines.copy);
@@ -2882,17 +3399,9 @@ impl GpuRenderer {
                 let (_, pipeline) = both.expect("created above");
                 Self::encode_vertical(&mut pass, pipeline, blur, &mut stats);
             }
-            self.encode_damage(
-                &mut pass,
-                frame,
-                (&pipelines.clear, &pipelines.quads),
-                &mut stats,
-            );
+            self.encode_damage(&mut pass, frame, pipelines.both.picks(), &mut stats);
             self.present_stats.draw_calls += stats.draw_calls + 1;
             self.present_stats.instances += stats.instances;
-        }
-        if !frame.regions.is_empty() {
-            self.single_pass_frames += 1;
         }
         // The spare now holds this frame; the old target becomes the spare,
         // keeping its view and bind groups for when it is drawn into again.
@@ -2929,9 +3438,16 @@ impl GpuRenderer {
         first: u32,
         stats: &mut GpuStats,
     ) {
-        let mut batch: Option<Batch> = None;
         // The pipeline set on `pass`: the caller's, until a batch sets one.
         let mut current = None;
+        self.batches(region, draws, first, |batch| {
+            self.encode_batch(pass, pipelines, &mut current, batch, stats)
+        });
+    }
+    /// The draws within `region` from instance `first` on, as batches:
+    /// consecutive draws sharing a clip, texture source and shading join.
+    fn batches(&self, region: Rect, draws: &[Draw], first: u32, mut emit: impl FnMut(Batch)) {
+        let mut batch: Option<Batch> = None;
         // Skipping blending pays for its extra draws only over many pixels:
         // a small region (a scrolled-in strip) blends plain quads in one draw.
         let pixels = region.width * region.height * self.scale * self.scale;
@@ -2947,7 +3463,7 @@ impl GpuRenderer {
             let start = draw.start.max(first);
             let Some(rect) = region.intersection(draw.clip) else {
                 if let Some(done) = batch.take() {
-                    self.encode_batch(pass, pipelines, &mut current, done, stats);
+                    emit(done);
                 }
                 continue;
             };
@@ -2960,7 +3476,7 @@ impl GpuRenderer {
                 }
                 _ => {
                     if let Some(done) = batch.take() {
-                        self.encode_batch(pass, pipelines, &mut current, done, stats);
+                        emit(done);
                     }
                     batch = Some(Batch {
                         rect,
@@ -2973,7 +3489,7 @@ impl GpuRenderer {
             }
         }
         if let Some(done) = batch.take() {
-            self.encode_batch(pass, pipelines, &mut current, done, stats);
+            emit(done);
         }
     }
     fn encode_batch<'p>(
@@ -3005,7 +3521,7 @@ impl GpuRenderer {
             ),
             &[],
         );
-        pass.draw(0..6, batch.start..batch.end);
+        pass.draw(0..4, batch.start..batch.end);
         stats.draw_calls += 1;
         stats.instances += (batch.end - batch.start) as usize;
     }
@@ -3205,7 +3721,13 @@ impl GpuRenderer {
         {
             return Err(GpuError("image exceeds GPU texture dimensions".into()));
         }
-        let texture = texture(&self.device, image.width(), image.height(), "image");
+        let texture = sampled_texture(
+            &self.device,
+            self.mapped.is_some(),
+            image.width(),
+            image.height(),
+            "image",
+        );
         let mut pixels = image.pixels().to_vec();
         for pixel in pixels.as_chunks_mut::<4>().0 {
             let alpha = u16::from(pixel[3]);
@@ -3213,21 +3735,7 @@ impl GpuRenderer {
                 *channel = ((u16::from(*channel) * alpha + 127) / 255) as u8;
             }
         }
-        if self.mapped.is_some() {
-            self.texture_uploads
-                .push(&texture, (0, 0, image.width(), image.height()), &pixels);
-        } else {
-            self.queue.write_texture(
-                texture.as_image_copy(),
-                &pixels,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(image.width() * 4),
-                    rows_per_image: None,
-                },
-                texture.size(),
-            );
-        }
+        self.write_texels(&texture, (0, 0, image.width(), image.height()), &mut pixels);
         let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("image"),
             layout: &self.context.inner.texture_layout,
@@ -3253,8 +3761,59 @@ impl GpuRenderer {
         self.images.insert(image.id(), (bind, bytes));
         Ok(())
     }
+    /// Write premultiplied RGBA texels to `(x, y, width, height)` of a
+    /// `sampled_texture`, which no submitted frame samples there.
+    fn write_texels(
+        &mut self,
+        target: &wgpu::Texture,
+        (x, y, width, height): (u32, u32, u32, u32),
+        rgba: &mut [u8],
+    ) {
+        #[cfg(target_os = "macos")]
+        if self.mapped.is_some() {
+            upload::write_texels(target, (x, y, width, height), rgba);
+            return;
+        }
+        if self.mapped.is_some() {
+            self.texture_uploads
+                .push(target, (x, y, width, height), rgba);
+        } else {
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: target,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x, y, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+    /// Before reusing atlas cells: the CPU writes them in place (macOS), so
+    /// every frame that sampled the old ones must have finished.
+    fn release_atlas_cells(&self) {
+        if cfg!(target_os = "macos") && self.mapped.is_some() {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        }
+    }
     fn reset_atlas(&mut self, size: u32) {
-        self.atlas = texture(&self.device, size, size, "glyph atlas");
+        self.atlas = sampled_texture(
+            &self.device,
+            self.mapped.is_some(),
+            size,
+            size,
+            "glyph atlas",
+        );
         self.atlas_size = size;
         self.bind = self.texture_bind(&self.atlas.create_view(&Default::default()), "glyph atlas");
         self.entries.clear();
@@ -3370,37 +3929,12 @@ impl GpuRenderer {
         }
         let mut rgba = vec![0; (cell_width * cell_height * 4) as usize];
         fill(&mut rgba);
-        if self.mapped.is_some() {
-            self.texture_uploads.push(
-                &self.atlas,
-                (self.cursor.0, self.cursor.1, cell_width, cell_height),
-                &rgba,
-            );
-        } else {
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.atlas,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: self.cursor.0,
-                        y: self.cursor.1,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &rgba,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(cell_width * 4),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: cell_width,
-                    height: cell_height,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+        let atlas = self.atlas.clone();
+        self.write_texels(
+            &atlas,
+            (self.cursor.0, self.cursor.1, cell_width, cell_height),
+            &mut rgba,
+        );
         let origin = (self.cursor.0 + 1, self.cursor.1 + 1);
         self.cursor.0 += cell_width;
         self.cursor.2 = self.cursor.2.max(cell_height);
@@ -3414,6 +3948,293 @@ impl GpuRenderer {
     pub fn present_with_status(&mut self) -> Result<PresentationStatus, GpuError> {
         self.present_with_notify(|| {})
     }
+    /// The copies bringing the current surface up to date from the one shown
+    /// (`buffers[shown]`): the changes since it was last shown, less what `regions`
+    /// repaint and `copies` cover this frame, then the scroll `copies`.
+    #[cfg(target_os = "macos")]
+    fn catch_up_draws(
+        &mut self,
+        shown: usize,
+        copies: &[ScrollCopy],
+        regions: &[(Rect, Scissor)],
+    ) -> Option<(wgpu::BindGroup, Vec<ScrollCopy>)> {
+        let mut missing = self
+            .layer_present
+            .as_mut()
+            .map(|present| std::mem::take(&mut present.catch_up))
+            .unwrap_or_default();
+        let mut rest = Vec::new();
+        // Whatever this frame repaints or copies over needs nothing first.
+        let cuts = regions
+            .iter()
+            .map(|(_, s)| *s)
+            .chain(copies.iter().map(|(s, _)| *s));
+        for cut in cuts {
+            for rect in missing.drain(..) {
+                scissor_minus(rect, cut, &mut rest);
+            }
+            std::mem::swap(&mut missing, &mut rest);
+        }
+        // Frames often change the same places: draw each pixel once where
+        // one rectangle holds another.
+        missing
+            .sort_unstable_by_key(|&(_, _, w, h)| std::cmp::Reverse(u64::from(w) * u64::from(h)));
+        let mut kept: Vec<Scissor> = Vec::with_capacity(missing.len());
+        for rect in missing {
+            if !kept.iter().any(|&outer| scissor_holds(outer, rect)) {
+                kept.push(rect);
+            }
+        }
+        if kept.is_empty() && copies.is_empty() {
+            return None;
+        }
+        let pipeline = self.copy_offset.get_or_insert_with(|| {
+            let shader = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("shifted copy"),
+                    source: wgpu::ShaderSource::Wgsl(include_str!("copy_offset.wgsl").into()),
+                });
+            self.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("shifted copy"),
+                    layout: None,
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs"),
+                        compilation_options: Default::default(),
+                        // A quad's rect (device pixels) and uv (the shift).
+                        buffers: &[wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Quad>() as u64,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+                        }],
+                    },
+                    primitive: QUAD_STRIP,
+                    depth_stencil: None,
+                    multisample: Default::default(),
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(FORMAT.into())],
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+        });
+        // Made once per surface: it is the source every other frame.
+        let source = &self.layer_present.as_ref()?.buffers[shown].0;
+        let bind = source
+            .copy_source
+            .get_or_init(|| {
+                self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("shifted copy source"),
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&source.view),
+                    }],
+                })
+            })
+            .clone();
+        let draws = kept
+            .into_iter()
+            .map(|rect| (rect, (0, 0)))
+            .chain(copies.iter().copied())
+            .collect();
+        Some((bind, draws))
+    }
+    /// Make a surface the retained target for the frame about to draw,
+    /// unless one is: one the window server is done with, with the regions it
+    /// lacks of the last frame queued to copy from the shown surface (none
+    /// when `whole`: the frame repaints everything).
+    #[cfg(target_os = "macos")]
+    fn begin_layer_frame(&mut self, whole: bool) -> Result<(), GpuError> {
+        let (width, height) = (self.width, self.height);
+        let Some(present) = self.layer_present.as_mut() else {
+            return Ok(());
+        };
+        if present.current.is_some() {
+            return Ok(());
+        }
+        if present
+            .buffers
+            .iter()
+            .any(|(b, _)| (b.texture.width(), b.texture.height()) != (width, height))
+        {
+            // Resized: the layer keeps showing the old surface until the next.
+            present.buffers.clear();
+            present.shown = None;
+            present.history.clear();
+        }
+        // Certainly free: not the latest, and no use beyond the layer's own
+        // record of it (one on screen or queued has more). The most recent of
+        // them holds the frame nearest this one.
+        let idle = |present: &LayerPresent| -> Vec<usize> {
+            let mut idle: Vec<usize> = (0..present.buffers.len())
+                .filter(|&i| Some(i) != present.shown && present.buffers[i].0.surface.use_count() <= 1)
+                .collect();
+            idle.sort_by_key(|&i| std::cmp::Reverse(present.buffers[i].1));
+            idle
+        };
+        let budget = if present.full_rate { LAYER_BUFFERS } else { 2 };
+        let mut free = idle(present);
+        // Slower again: the third surface goes once free.
+        if present.buffers.len() > budget && let Some(&spare) = free.last() {
+            present.buffers.remove(spare);
+            if let Some(shown) = &mut present.shown
+                && *shown > spare
+            {
+                *shown -= 1;
+            }
+            free = idle(present);
+        }
+        // None: ask the layer which it no longer shows nor queues (it holds a
+        // surface a while after showing the next; that one is free).
+        let pick = |present: &LayerPresent| {
+            let busy = present.busy();
+            (0..present.buffers.len())
+                .filter(|&i| Some(i) != present.shown && !busy[i])
+                .max_by_key(|&i| present.buffers[i].1)
+        };
+        let mut index = free.first().copied().or_else(|| pick(present));
+        if index.is_none() && present.buffers.len() < budget {
+            present.buffers.push((
+                layer_present::Buffer::new(&self.device, width, height)?,
+                None,
+            ));
+            index = Some(present.buffers.len() - 1);
+        }
+        // Still none: the layer moves on by its next refresh.
+        let started = std::time::Instant::now();
+        let mut asked = started;
+        while index.is_none() && started.elapsed() < std::time::Duration::from_millis(20) {
+            std::thread::sleep(std::time::Duration::from_micros(100));
+            index = idle(present).first().copied();
+            if index.is_none() && asked.elapsed() >= std::time::Duration::from_millis(2) {
+                asked = std::time::Instant::now();
+                index = pick(present);
+            }
+        }
+        let index = index.unwrap_or_else(|| {
+            (0..present.buffers.len())
+                .find(|&i| Some(i) != present.shown)
+                .expect("more than one surface")
+        });
+        let held = present.buffers[index].1;
+        let latest = present.shown.and_then(|shown| present.buffers[shown].1);
+        present.catch_up = match (whole, latest) {
+            (true, _) | (false, None) => Vec::new(),
+            (false, Some(latest)) if held == Some(latest) => Vec::new(),
+            (false, Some(_)) => match held {
+                // The changes of every frame since the one it holds.
+                Some(held) if present.history.front().is_some_and(|(f, _)| *f <= held + 1) => {
+                    present
+                        .history
+                        .iter()
+                        .filter(|(frame, _)| *frame > held)
+                        .flat_map(|(_, changed)| changed.iter().copied())
+                        .collect()
+                }
+                _ => vec![(0, 0, width, height)],
+            },
+        };
+        let buffer = &present.buffers[index].0;
+        self.target = buffer.texture.clone();
+        self.view = buffer.view.clone();
+        present.current = Some(index);
+        Ok(())
+    }
+    /// Show the retained frame (the current surface) through the layer.
+    #[cfg(target_os = "macos")]
+    fn present_layer(
+        &mut self,
+        before_present: impl FnOnce(),
+    ) -> Result<PresentationStatus, GpuError> {
+        let mut present = self.layer_present.take().expect("layer presenting");
+        if present.layer.is_none() {
+            let surface = self.surface.as_ref().expect("a window surface");
+            // SAFETY: The HAL guard only borrows this live surface for the call.
+            let hal = unsafe { surface.as_hal::<wgpu::hal::api::Metal>() }
+                .ok_or_else(|| GpuError("not a Metal surface".into()))?;
+            present.layer = Some(layer_present::Layer::attach(&hal.render_layer().lock()));
+        }
+        let Some(index) = present.current.take() else {
+            // Nothing drawn since: the shown frame stands.
+            self.layer_present = Some(present);
+            return Ok(PresentationStatus::Presented);
+        };
+        // The window server reads the surface from its next composite: the
+        // frame must be complete by then.
+        if self.finish_direct() {
+            // wgpu still frees what was dropped once its own work is done.
+            if present.frame.is_multiple_of(64) {
+                let _ = self.device.poll(wgpu::PollType::Poll);
+            }
+        } else {
+            let encoder = self
+                .pending
+                .get_mut()
+                .take()
+                .unwrap_or_else(|| self.device.create_command_encoder(&Default::default()));
+            let submission = self.queue.submit([encoder.finish()]);
+            self.belt.get_mut().recall();
+            self.submitted();
+            if let Some(mapped) = self.mapped.as_mut() {
+                mapped.get_mut().submitted();
+            }
+            let _ = self.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            });
+        }
+        before_present();
+        let now = std::time::Instant::now();
+        let steady = present.full_rate
+            || present
+                .shown_at
+                .is_some_and(|at| now - at < std::time::Duration::from_millis(50));
+        present.shown_at = Some(now);
+        let layer = present.layer.as_mut().expect("attached above");
+        layer.show(&present.buffers[index].0, self.background.3 == 255, steady);
+        present.frame += 1;
+        let frame = present.frame;
+        present.buffers[index].1 = Some(frame);
+        present.shown = Some(index);
+        let changed = std::mem::take(&mut present.changed);
+        present.history.push_back((frame, changed));
+        if present.history.len() > LAYER_HISTORY {
+            present.history.pop_front();
+        }
+        self.layer_present = Some(present);
+        Ok(PresentationStatus::Presented)
+    }
+    /// Whether frames come at the display's full rate (animating or
+    /// scrolling). On macOS a display layer still holds the surface shown
+    /// before the shown one when the next frame starts, so full-rate frames
+    /// keep a third surface; slower ones reuse that surface once the layer
+    /// shows the next. Elsewhere ignored.
+    pub fn set_full_rate(&mut self, #[allow(unused)] full: bool) {
+        #[cfg(target_os = "macos")]
+        if let Some(present) = &mut self.layer_present {
+            present.full_rate = full;
+        }
+    }
+    /// Encode plain frames with Metal directly (the default on macOS) or
+    /// always through wgpu: for comparing the two. Elsewhere ignored.
+    #[doc(hidden)]
+    pub fn set_direct_metal(&mut self, #[allow(unused)] enabled: bool) {
+        #[cfg(target_os = "macos")]
+        {
+            self.flush_pending();
+            self.metal_frame = if enabled {
+                Default::default()
+            } else {
+                std::cell::OnceCell::from(None)
+            };
+        }
+    }
     /// Notify the native host immediately before committing an acquired frame.
     /// Skipped acquisition never invokes the callback, so Wayland hosts do not
     /// wait for a frame callback on a surface commit that never happened.
@@ -3423,6 +4244,10 @@ impl GpuRenderer {
     ) -> Result<PresentationStatus, GpuError> {
         if self.surface.is_none() {
             return Ok(PresentationStatus::Offscreen);
+        }
+        #[cfg(target_os = "macos")]
+        if self.layer_present.is_some() {
+            return self.present_layer(before_present);
         }
         let frame = match surface::acquire(self)? {
             surface::Acquired::Frame(frame) => frame,
@@ -3501,6 +4326,19 @@ impl GpuRenderer {
         self.flush_pending();
         self.blur_scratch = None;
         self.spare = None;
+        // Idle: only the shown surface is needed; the next frame makes another.
+        #[cfg(target_os = "macos")]
+        if let Some(present) = &mut self.layer_present
+            && present.current.is_none()
+            && let Some(shown) = present.shown
+        {
+            let kept = present.buffers.swap_remove(shown);
+            present.buffers = vec![kept];
+            present.shown = Some(0);
+            if let Some(layer) = &mut present.layer {
+                layer.rest(&present.buffers[0].0);
+            }
+        }
         if let Some(mapped) = &mut self.mapped {
             mapped.get_mut().trim();
         }
@@ -3580,11 +4418,15 @@ impl GpuRenderer {
         self.transaction_present = enabled;
     }
     /// Frames whose damage was drawn in the same pass as presentation.
+    /// Frames presented to the drawable alone, the retained target untouched.
+    pub fn debug_direct_frames(&self) -> u64 {
+        self.direct_frames
+    }
     pub fn debug_single_pass_frames(&self) -> u64 {
         self.single_pass_frames
     }
-    /// Test hook: draw plain quads with the lighter shader, as on software
-    /// rasterizers (see `push_draw`), or everything with the full one.
+    /// Test hook: draw plain quads with the basic shader, or every quad with
+    /// the full shader.
     pub fn debug_split_shading(&mut self, split: bool) {
         self.split_shading = split;
     }
@@ -3708,6 +4550,73 @@ impl GpuRenderer {
         Ok(pixels)
     }
 }
+/// `rect` less `cut`, as up to four rectangles pushed to `out`.
+fn scissor_minus(rect: Scissor, cut: Scissor, out: &mut Vec<Scissor>) {
+    let (x, y, right, bottom) = (rect.0, rect.1, rect.0 + rect.2, rect.1 + rect.3);
+    let (cx, cy, cr, cb) = (cut.0, cut.1, cut.0 + cut.2, cut.1 + cut.3);
+    if cx >= right || cr <= x || cy >= bottom || cb <= y {
+        out.push(rect);
+        return;
+    }
+    // Full-width bands above and below the cut, then its sides between.
+    if cy > y {
+        out.push((x, y, rect.2, cy - y));
+    }
+    if cb < bottom {
+        out.push((x, cb, rect.2, bottom - cb));
+    }
+    let (top, low) = (cy.max(y), cb.min(bottom));
+    if cx > x {
+        out.push((x, top, cx - x, low - top));
+    }
+    if cr < right {
+        out.push((cr, top, right - cr, low - top));
+    }
+}
+/// Whether `outer` contains `inner`.
+fn scissor_holds(outer: Scissor, inner: Scissor) -> bool {
+    outer.0 <= inner.0
+        && outer.1 <= inner.1
+        && outer.0 + outer.2 >= inner.0 + inner.2
+        && outer.1 + outer.3 >= inner.1 + inner.3
+}
+/// A texture draws sample and the CPU writes (glyph cells, images): with
+/// `cpu_writes` on macOS, in shared memory written in place
+/// (`upload::shared_texture`).
+fn sampled_texture(
+    device: &wgpu::Device,
+    #[allow(unused)] cpu_writes: bool,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
+    #[cfg(target_os = "macos")]
+    if cpu_writes {
+        return upload::shared_texture(device, width, height, label);
+    }
+    texture(device, width, height, label)
+}
+/// Clear a new target through wgpu, so wgpu knows it is written: frames drawn
+/// with Metal directly (`render_direct`) write it behind wgpu's back, and wgpu
+/// zeroes a texture it has never written on that texture's first use.
+#[cfg(target_os = "macos")]
+fn written(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView) {
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("new target"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    queue.submit([encoder.finish()]);
+}
 fn texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -3749,6 +4658,48 @@ fn rgba(c: Color, opacity: f32) -> [f32; 4] {
 }
 /// Quads into the retained target, or with `drawable` also into a second,
 /// presentation target in the same pass (`fs_both`).
+/// The full quad shader drawing into a drawable of `format` alone
+/// (`Deferred::direct`).
+fn drawable_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    blend: bool,
+    format: wgpu::TextureFormat,
+    basic: bool,
+) -> wgpu::RenderPipeline {
+    let all = wgpu::vertex_attr_array![0=>Float32x4,1=>Float32x4,2=>Float32x4,3=>Float32x4,4=>Float32x4,5=>Float32x4,6=>Float32x4,7=>Float32x4];
+    let basic_attributes = [all[0], all[1], all[2], all[4]];
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("quads to the drawable"),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some(if basic { "vs_basic" } else { "vs" }),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: 128,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: if basic { &basic_attributes } else { &all },
+            }],
+        },
+        primitive: QUAD_STRIP,
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some(if basic { "fs_basic" } else { "fs" }),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: blend.then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
+}
 fn quad_pipeline(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
@@ -3782,14 +4733,15 @@ fn quad_pipeline(
                 attributes: if basic { &basic_attributes } else { &all },
             }],
         },
-        primitive: Default::default(),
+        primitive: QUAD_STRIP,
         depth_stencil: None,
         multisample: Default::default(),
         fragment: Some(wgpu::FragmentState {
             module: shader,
             // Single-pass presentation draws with the full shader alone.
             entry_point: Some(match (basic, drawable.is_some()) {
-                (true, _) => "fs_basic",
+                (true, true) => "fs_basic_both",
+                (true, false) => "fs_basic",
                 (false, true) => "fs_both",
                 (false, false) => "fs",
             }),
@@ -3878,12 +4830,22 @@ fn snap_out(r: Rect, scale: f32) -> Rect {
 }
 /// Whether `quad` lies entirely within `clip`.
 fn inside(quad: &Quad, clip: Rect) -> bool {
-    let [x, y, w, h] = quad.rect;
+    let Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    } = quad_rect(quad);
     x >= clip.x && y >= clip.y && x + w <= clip.x + clip.width && y + h <= clip.y + clip.height
 }
 /// Whether `clip` would cut `quad` rather than keep or cull it whole.
 fn crosses(quad: &Quad, clip: Rect) -> bool {
-    let [x, y, w, h] = quad.rect;
+    let Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    } = quad_rect(quad);
     let outside =
         x + w <= clip.x || y + h <= clip.y || x >= clip.x + clip.width || y >= clip.y + clip.height;
     !outside && !inside(quad, clip)
@@ -3946,14 +4908,148 @@ fn rounded_damage(rect: Rect, viewport: Rect, scale: f32) -> Option<Rect> {
         ((rect.y + rect.height) * scale).ceil() / scale - y,
     ))
 }
+/// Push a panel quad. An opaque one with rounded corners or a border paints
+/// exactly its fill colour away from its edges (in `shade`: past the corner
+/// radius, the border and the antialiasing band of at most two device
+/// pixels): that interior goes as a flat opaque quad, drawn unblended so the
+/// GPU skips shading whatever it covers, and only the four bands around it
+/// need the distance field and blending. Every band keeps the
+/// panel's own outer edges (the right and bottom ones measured back from the
+/// far edge), so the same pixels are covered and antialiased; the seams
+/// between pieces lie on whole device pixels, where rounding cannot move a
+/// pixel centre across them.
+fn push_panel(quads: &mut Vec<Quad>, quad: Quad, scale: f32, split: bool) {
+    let radius = if quad.options[3] > 0.5 {
+        quad.border.iter().copied().fold(0., f32::max)
+    } else {
+        quad.shape[0]
+    };
+    let band = radius.max(quad.shape[1] + 1.).max(0.) + 1.;
+    let [x, y, width, height] = quad.rect;
+    let (right, bottom) = (x + width, y + height);
+    // The interior, on device pixels inside the bands.
+    let (left, top) = (
+        ((x + band) * scale).ceil() / scale,
+        ((y + band) * scale).ceil() / scale,
+    );
+    let (inner_right, inner_bottom) = (
+        ((right - band) * scale).floor() / scale,
+        ((bottom - band) * scale).floor() / scale,
+    );
+    let (inner_width, inner_height) = (inner_right - left, inner_bottom - top);
+    if !split
+        || quad.color[3] < 1.
+        || quad.options[..3] != [0.; 3]
+        || quad.shape[2] > 0.
+        || quad.shape[3] <= 0.5
+        || quad.rect != quad.fade
+        || inner_width <= 0.
+        || inner_height <= 0.
+        || inner_width * inner_height < PANEL_INTERIOR
+    {
+        quads.push(quad);
+        return;
+    }
+    for rect in [
+        [x, y, width, top - y],
+        [x, bottom, width, inner_bottom - bottom],
+        [x, top, left - x, inner_height],
+        [right, top, inner_right - right, inner_height],
+    ] {
+        quads.push(Quad { rect, ..quad });
+    }
+    // Last, and opaque: drawn without blending, it hides what lies beneath
+    // (the GPU skips shading fragments an opaque one covers), as the whole
+    // panel's blended shader could not.
+    let interior = [left, top, inner_width, inner_height];
+    quads.push(Quad {
+        rect: interior,
+        fade: interior,
+        options: [0.; 4],
+        shape: [0.; 4],
+        border: [0.; 4],
+        ..quad
+    });
+}
+/// Panels split only with an interior of at least this many logical pixels:
+/// below, five quads cost more than shading one.
+const PANEL_INTERIOR: f32 = 1024.;
+/// Quads draw as four-vertex triangle strips, one per instance.
+pub(crate) const QUAD_STRIP: wgpu::PrimitiveState = wgpu::PrimitiveState {
+    topology: wgpu::PrimitiveTopology::TriangleStrip,
+    strip_index_format: None,
+    front_face: wgpu::FrontFace::Ccw,
+    cull_mode: None,
+    unclipped_depth: false,
+    polygon_mode: wgpu::PolygonMode::Fill,
+    conservative: false,
+};
+/// Regions a frame draws at most: each draws every batch it touches again.
+const MAX_REGIONS: usize = 16;
+/// Damage in at most `MAX_REGIONS` groups, each the bounds of its members:
+/// rectangles sharing a cell of a grid whose cells double until few enough.
+fn cluster_damage(damage: &[Rect], viewport: Rect) -> Vec<Rect> {
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    let mut cell = 16_f32;
+    loop {
+        let columns = (viewport.width / cell).ceil().max(1.) as usize;
+        let rows = (viewport.height / cell).ceil().max(1.) as usize;
+        let mut owner = vec![usize::MAX; columns * rows];
+        let mut parent: Vec<usize> = (0..damage.len()).collect();
+        for (i, r) in damage.iter().enumerate() {
+            let first =
+                |value: f32, count: usize| ((value / cell).floor().max(0.) as usize).min(count);
+            let end =
+                |value: f32, count: usize| ((value / cell).ceil().max(0.) as usize).min(count);
+            for row in first(r.y, rows)..end(r.y + r.height, rows) {
+                for column in first(r.x, columns)..end(r.x + r.width, columns) {
+                    let slot = &mut owner[row * columns + column];
+                    if *slot == usize::MAX {
+                        *slot = i;
+                    } else {
+                        let (a, b) = (root(&mut parent, i), root(&mut parent, *slot));
+                        parent[a] = b;
+                    }
+                }
+            }
+        }
+        let mut bounds: Vec<Option<Rect>> = vec![None; damage.len()];
+        for (i, r) in damage.iter().enumerate() {
+            let group = &mut bounds[root(&mut parent, i)];
+            *group = Some(group.map_or(*r, |g| g.union(*r)));
+        }
+        let groups: Vec<Rect> = bounds.into_iter().flatten().collect();
+        if groups.len() <= MAX_REGIONS || cell >= viewport.width.max(viewport.height) {
+            return groups;
+        }
+        cell *= 2.;
+    }
+}
 fn merge_damage(damage: &[Rect], viewport: Rect, scale: f32) -> Vec<Rect> {
     // Each region redraws every batch it touches: nearby small ones (the
-    // dots of a spinner) are fewer draws as one, for a few more pixels.
+    // dots of a spinner) are fewer draws as one, for a few more pixels. The
+    // pixels gained are bounded by the smaller region, so a large region
+    // doesn't swallow every small one in reach, growing as it goes.
     let area = |r: Rect| r.width * r.height * scale * scale;
     let close = |a: Rect, b: Rect| {
-        a.intersects(b) || area(a.union(b)) <= (area(a) + area(b)) * 1.5 + NEAR_PIXELS
+        let (a, b) = (area(a), area(b));
+        a + b + a.min(b) * 0.5 + NEAR_PIXELS
     };
+    let close = |a: Rect, b: Rect| a.intersects(b) || area(a.union(b)) <= close(a, b);
     let mut regions: Vec<Rect> = Vec::new();
+    let rounded: Vec<Rect>;
+    let damage = if damage.len() > MAX_REGIONS {
+        rounded = cluster_damage(damage, viewport);
+        &rounded[..]
+    } else {
+        damage
+    };
     for r in damage {
         let Some(mut r) = rounded_damage(*r, viewport, scale) else {
             continue;
@@ -4014,7 +5110,7 @@ fn create_quad_pipelines(
         label: Some("viewport"),
         entries: &[wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,

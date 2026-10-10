@@ -4,6 +4,9 @@
 //! the driver's blit machinery (~110 MB on Apple GPUs) resident while anything
 //! animates. With `MAPPABLE_PRIMARY_BUFFERS` the CPU writes vertex buffers
 //! directly; each buffer is remapped once the GPU has finished reading it.
+//! On macOS the buffers are shared memory the CPU writes in place, never
+//! mapped through wgpu: mapping and unmapping one each frame cost more than
+//! writing it.
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -16,30 +19,48 @@ const MIN_BYTES: u64 = 4096;
 struct Slot {
     buffer: wgpu::Buffer,
     capacity: u64,
-    /// Set by the map callback: the CPU may write the buffer again.
+    /// The CPU may write the buffer: mapped, or (macOS) the GPU has finished
+    /// the submission that read it.
     mapped: Arc<AtomicBool>,
-    /// Written and unmapped this frame; remap after the frame is submitted.
+    /// Written for the coming submission; released once it completes.
     remap: bool,
+    /// macOS: the buffer's memory, written in place.
+    #[cfg(target_os = "macos")]
+    contents: std::ptr::NonNull<u8>,
+    /// macOS: the buffer itself, for frames encoded with Metal directly.
+    #[cfg(target_os = "macos")]
+    metal: objc2::rc::Retained<
+        objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+    >,
 }
 
 pub(crate) struct MappedRing {
     device: wgpu::Device,
+    #[cfg(target_os = "macos")]
+    queue: wgpu::Queue,
     slots: Vec<Slot>,
+    /// The slot `write` filled last.
+    #[cfg(target_os = "macos")]
+    last: usize,
 }
 impl MappedRing {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
+    pub(crate) fn new(device: &wgpu::Device, #[allow(unused)] queue: &wgpu::Queue) -> Self {
         Self {
             device: device.clone(),
+            #[cfg(target_os = "macos")]
+            queue: queue.clone(),
             slots: Vec::new(),
+            #[cfg(target_os = "macos")]
+            last: 0,
         }
     }
-    /// Copy `bytes` into a CPU-mapped vertex buffer and return it unmapped.
-    /// The second value reports a new allocation.
+    /// Copy `bytes` into a CPU-written vertex buffer and return it, ready
+    /// for the GPU. The second value reports a new allocation.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> (wgpu::Buffer, bool) {
         let len = bytes.len() as u64;
         let mut index = self.ready(len);
         if index.is_none() {
-            // Deliver map callbacks for frames the GPU has already finished.
+            // Deliver callbacks for frames the GPU has already finished.
             let _ = self.device.poll(wgpu::PollType::Poll);
             index = self.ready(len);
         }
@@ -49,44 +70,139 @@ impl MappedRing {
             index = self.ready(len);
         }
         let allocated = index.is_none();
-        let index = index.unwrap_or_else(|| {
-            // Replace a too-small idle buffer instead of accumulating them.
-            if let Some(small) = self
-                .slots
-                .iter()
-                .position(|slot| slot.mapped.load(Ordering::Acquire) && slot.capacity < len)
-            {
-                self.slots.swap_remove(small);
+        let index = match index {
+            Some(index) => index,
+            None => {
+                // Replace a too-small idle buffer instead of accumulating them.
+                if let Some(small) = self
+                    .slots
+                    .iter()
+                    .position(|slot| slot.mapped.load(Ordering::Acquire) && slot.capacity < len)
+                {
+                    self.slots.swap_remove(small);
+                }
+                let capacity = len.next_power_of_two().max(MIN_BYTES);
+                self.slots.push(self.slot(capacity));
+                self.slots.len() - 1
             }
-            let capacity = len.next_power_of_two().max(MIN_BYTES);
-            self.slots.push(Slot {
-                buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("mapped frame vertices"),
-                    size: capacity,
-                    usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::VERTEX,
-                    mapped_at_creation: true,
-                }),
-                capacity,
-                mapped: Arc::new(AtomicBool::new(true)),
-                remap: false,
-            });
-            self.slots.len() - 1
-        });
+        };
         let slot = &mut self.slots[index];
-        if len > 0 {
-            slot.buffer
-                .slice(..len)
-                .get_mapped_range_mut()
-                .copy_from_slice(bytes);
+        #[cfg(target_os = "macos")]
+        // SAFETY: The slot is ready: no submission still reads it, and its
+        // memory holds `capacity` bytes, at least `len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.contents.as_ptr(), bytes.len())
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            if len > 0 {
+                slot.buffer
+                    .slice(..len)
+                    .get_mapped_range_mut()
+                    .copy_from_slice(bytes);
+            }
+            slot.buffer.unmap();
         }
-        slot.buffer.unmap();
         slot.mapped.store(false, Ordering::Release);
         slot.remap = true;
+        #[cfg(target_os = "macos")]
+        {
+            self.last = index;
+        }
         (slot.buffer.clone(), allocated)
+    }
+    /// The Metal buffer `write` filled last.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn last_metal(
+        &self,
+    ) -> &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer> {
+        &self.slots[self.last].metal
+    }
+    /// The GPU has finished every frame written so far (one encoded with
+    /// Metal directly, waited for): their buffers are writable again.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn completed(&mut self) {
+        for slot in self.slots.iter_mut().filter(|slot| slot.remap) {
+            slot.remap = false;
+            slot.mapped.store(true, Ordering::Release);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    fn slot(&self, capacity: u64) -> Slot {
+        use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+        // SAFETY: The HAL guard only borrows this live device for the call.
+        let hal = unsafe { self.device.as_hal::<wgpu::hal::api::Metal>() }.expect("a Metal device");
+        let raw = hal
+            .raw_device()
+            .newBufferWithLength_options(
+                capacity as usize,
+                MTLResourceOptions::StorageModeShared
+                    | MTLResourceOptions::CPUCacheModeWriteCombined,
+            )
+            .expect("a shared vertex buffer");
+        drop(hal);
+        let contents = raw.contents().cast::<u8>();
+        let metal = raw.clone();
+        // SAFETY: Metal made this buffer on this device, `capacity` bytes long;
+        // wgpu takes ownership of it and keeps it alive with the slot.
+        let buffer = unsafe {
+            let raw = wgpu::hal::metal::Device::buffer_from_raw(raw, capacity);
+            self.device.create_buffer_from_hal::<wgpu::hal::api::Metal>(
+                raw,
+                &wgpu::BufferDescriptor {
+                    label: Some("frame vertices"),
+                    size: capacity,
+                    usage: wgpu::BufferUsages::VERTEX,
+                    mapped_at_creation: false,
+                },
+            )
+        };
+        Slot {
+            buffer,
+            capacity,
+            mapped: Arc::new(AtomicBool::new(true)),
+            remap: false,
+            contents,
+            metal,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    fn slot(&self, capacity: u64) -> Slot {
+        Slot {
+            buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mapped frame vertices"),
+                size: capacity,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::VERTEX,
+                mapped_at_creation: true,
+            }),
+            capacity,
+            mapped: Arc::new(AtomicBool::new(true)),
+            remap: false,
+        }
     }
     /// Call after every submission: buffers written for it become writable
     /// again once the GPU completes it.
     pub(crate) fn submitted(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            let written: Vec<_> = self
+                .slots
+                .iter_mut()
+                .filter(|slot| slot.remap)
+                .map(|slot| {
+                    slot.remap = false;
+                    slot.mapped.clone()
+                })
+                .collect();
+            if !written.is_empty() {
+                self.queue.on_submitted_work_done(move || {
+                    for ready in written {
+                        ready.store(true, Ordering::Release);
+                    }
+                });
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
         for slot in self.slots.iter_mut().filter(|slot| slot.remap) {
             slot.remap = false;
             let mapped = slot.mapped.clone();
@@ -151,6 +267,117 @@ pub(crate) fn init_buffer(
     buffer
 }
 
+/// macOS with unified memory: a sampled texture in shared memory, written by
+/// the CPU in place (`write_texels`). No upload pass, so no command buffer of
+/// its own: the driver keeps memory for as many command buffers as were ever
+/// alive at once, for good. Made through the HAL, wgpu takes it as
+/// initialized and never clears it first either.
+#[cfg(target_os = "macos")]
+pub(crate) fn shared_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
+    use objc2_metal::{
+        MTLDevice, MTLPixelFormat, MTLStorageMode, MTLTextureDescriptor, MTLTextureType,
+        MTLTextureUsage,
+    };
+    // SAFETY: The HAL guard only borrows this live device for the call.
+    let hal = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }.expect("a Metal device");
+    // SAFETY: A plain 2D texture descriptor of this size.
+    let descriptor = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            MTLPixelFormat::BGRA8Unorm,
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    descriptor.setUsage(MTLTextureUsage::ShaderRead);
+    descriptor.setStorageMode(MTLStorageMode::Shared);
+    let metal = hal
+        .raw_device()
+        .newTextureWithDescriptor(&descriptor)
+        .expect("a shared texture");
+    drop(hal);
+    // SAFETY: Metal made this texture on this device, in `FORMAT`, this size;
+    // wgpu takes ownership of it.
+    unsafe {
+        let raw = wgpu::hal::metal::Device::texture_from_raw(
+            metal,
+            crate::FORMAT,
+            MTLTextureType::Type2D,
+            1,
+            1,
+            wgpu::hal::CopyExtent {
+                width,
+                height,
+                depth: 1,
+            },
+        );
+        device.create_texture_from_hal::<wgpu::hal::api::Metal>(
+            raw,
+            &wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: crate::FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            },
+        )
+    }
+}
+
+/// Write premultiplied RGBA texels (reordered in place to the texture's
+/// BGRA) to `(x, y, width, height)` of a `shared_texture`. No submission may
+/// still read that region: the caller writes only cells no submitted frame
+/// samples.
+#[cfg(target_os = "macos")]
+pub(crate) fn write_texels(
+    texture: &wgpu::Texture,
+    (x, y, width, height): (u32, u32, u32, u32),
+    rgba: &mut [u8],
+) {
+    use objc2_metal::{MTLOrigin, MTLRegion, MTLSize, MTLTexture};
+    debug_assert_eq!(rgba.len(), (width * height * 4) as usize);
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
+    // SAFETY: The HAL guard only borrows this live texture for the call.
+    let hal = unsafe { texture.as_hal::<wgpu::hal::api::Metal>() }.expect("a Metal texture");
+    let region = MTLRegion {
+        origin: MTLOrigin {
+            x: x as usize,
+            y: y as usize,
+            z: 0,
+        },
+        size: MTLSize {
+            width: width as usize,
+            height: height as usize,
+            depth: 1,
+        },
+    };
+    // SAFETY: A shared texture's region within its bounds, from `rgba`
+    // holding `height` rows of `width * 4` bytes.
+    unsafe {
+        hal.raw_handle()
+            .replaceRegion_mipmapLevel_withBytes_bytesPerRow(
+                region,
+                0,
+                std::ptr::NonNull::from(&mut *rgba).cast(),
+                (width * 4) as usize,
+            )
+    };
+}
+
 /// Texture writes queued while building a frame: glyph cells, images and
 /// rasterized canvases. A render pass per target texture draws them from a
 /// CPU-mapped buffer, so uploads never open a transfer encoder.
@@ -189,6 +416,9 @@ impl TextureUploads {
         rects.push([x, y, width, height]);
         rects.push([offset, 0, 0, 0]);
     }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
     /// Record every queued write; returns the number of regions written.
     pub(crate) fn encode(
         &mut self,
@@ -213,7 +443,7 @@ impl TextureUploads {
                     compilation_options: Default::default(),
                     buffers: &[],
                 },
-                primitive: Default::default(),
+                primitive: crate::QUAD_STRIP,
                 depth_stencil: None,
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
@@ -275,7 +505,7 @@ impl TextureUploads {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind, &[]);
-            pass.draw(0..6, 0..count as u32);
+            pass.draw(0..4, 0..count as u32);
         }
         // A burst (a first frame's icons and glyphs) need not stay allocated.
         if self.pixels.capacity() > STAGING_KEEP {

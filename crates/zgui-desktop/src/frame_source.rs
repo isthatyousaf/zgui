@@ -24,16 +24,26 @@ pub(crate) fn interval_for(refresh_hz: Option<f64>) -> Duration {
 /// fixed grid from `epoch`, so a late wake-up does not drift later ticks.
 pub(crate) struct FrameTimer {
     epoch: Instant,
+    /// The index of the refresh starting at `epoch`.
+    first: u64,
 }
 impl FrameTimer {
     pub(crate) fn new(epoch: Instant) -> Self {
-        Self { epoch }
+        Self { epoch, first: 0 }
+    }
+    /// Ticks continuing a native source's: refresh `first` starts at `epoch`.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn aligned(epoch: Instant, first: u64) -> Self {
+        Self { epoch, first }
     }
     fn index(&self, at: Instant, interval: Duration) -> u64 {
         (at.saturating_duration_since(self.epoch).as_secs_f64() / interval.as_secs_f64()) as u64
     }
     /// The first refresh boundary strictly after `now`.
     pub(crate) fn next_deadline(&self, now: Instant, interval: Duration) -> Instant {
+        if now < self.epoch {
+            return self.epoch;
+        }
         let next = self.index(now, interval) + 1;
         self.epoch + interval.mul_f64(next as f64)
     }
@@ -42,12 +52,17 @@ impl FrameTimer {
     pub(crate) fn frame(&self, now: Instant, interval: Duration) -> Frame {
         let index = self.index(now, interval);
         Frame {
-            index,
+            index: self.first + index,
             time: self.epoch + interval.mul_f64((index + 1) as f64),
             interval,
         }
     }
 }
+
+/// How long a refresh grid learned from the display link paces frames
+/// before the link runs again to resync it (see `Host::sync_frames`).
+#[cfg(target_os = "macos")]
+pub(crate) const VSYNC_RESYNC: Duration = Duration::from_secs(1);
 
 #[cfg(target_os = "macos")]
 pub(crate) use display_link::DisplayLink;

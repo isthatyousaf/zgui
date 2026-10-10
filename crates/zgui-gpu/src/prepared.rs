@@ -50,6 +50,15 @@ const TAB_WIDTH: u16 = 8;
 /// Texts at least this long (bytes) that a new text extends are dropped as a
 /// stream's previous states.
 const SUPERSEDED: usize = 32;
+/// Lines of dropped texts kept for new texts to shape into, and the longest
+/// kept: values that change every frame replace as many texts as they shape.
+/// Only short lines: a reused line keeps the capacity it grew to.
+const SPARE_LINES: usize = 128;
+const SPARE_TEXT: usize = 32;
+/// A few longer lines too, for a stream's window of text: its lines all shift
+/// as it grows, so each frame replaces every one.
+const SPARE_LONG_LINES: usize = 16;
+const SPARE_LONG_TEXT: usize = 256;
 
 /// The spans that determine shapes: merged runs of one font and size.
 #[derive(Clone, PartialEq)]
@@ -412,6 +421,11 @@ pub struct TextCache {
     /// Texts shaped, and requests served without shaping, for tests and stats.
     pub shaped: u64,
     pub hits: u64,
+    /// Lines of dropped texts, their allocations reused by new ones: freeing
+    /// and allocating a shaped line's many small parts costs more than
+    /// shaping a short value.
+    spare: Vec<BufferLine>,
+    spare_long: Vec<BufferLine>,
 }
 impl TextCache {
     /// Whether `rich` goes through the cache: clamped or ellipsized text is
@@ -546,7 +560,8 @@ impl TextCache {
             let entry = &self.entries[&hash];
             kept += entry.shaped_bytes();
             if kept > UNDRAWN_BUDGET {
-                self.remove(hash);
+                let entry = self.remove(hash);
+                self.recycle(entry.lines);
             }
         }
     }
@@ -618,6 +633,7 @@ impl TextCache {
                 // A hash collision: the newer text wins.
                 self.shaped_bytes -= old.shaped_bytes();
                 self.compact_bytes -= old.compact_bytes();
+                self.recycle(old.lines);
             }
             if detached {
                 return hash;
@@ -643,13 +659,18 @@ impl TextCache {
         // `ShapedText::with_runs` adds an unshaped row for an editor's caret
         // after a final line break, which its size leaves out: so is it here.
         // `ShapedText::with_font` shapes it, so plain text keeps it.
+        let recycled = self.spare_for(rich.text());
         let mut buffer = match rich.runs() {
             // Plain text without per-span attributes, which cosmic-text looks
             // up for every word: shaped as `ShapedText::with_font` shapes it.
-            [run] if caret_row => {
-                crate::text::plain_buffer_unshaped(fonts, rich.text(), run.font_size, &run.font)
-            }
-            _ => crate::text::rich_buffer_unshaped(fonts, rich, false),
+            [run] if caret_row => crate::text::plain_buffer_unshaped(
+                fonts,
+                rich.text(),
+                run.font_size,
+                &run.font,
+                recycled,
+            ),
+            _ => crate::text::rich_buffer_unshaped(fonts, rich, false, recycled),
         };
         if caret_row
             && rich.text().ends_with(['\r', '\n'])
@@ -715,7 +736,8 @@ impl TextCache {
             })
             .collect();
         for hash in extended {
-            self.remove(hash);
+            let entry = self.remove(hash);
+            self.recycle(entry.lines);
         }
         (lines, metrics)
     }
@@ -725,6 +747,35 @@ impl TextCache {
         self.compact_bytes -= entry.compact_bytes();
         self.recent.retain(|recent| *recent != hash);
         entry
+    }
+    /// Keep `lines` for new texts to shape into.
+    fn recycle(&mut self, lines: Option<Vec<BufferLine>>) {
+        for line in lines.into_iter().flatten() {
+            let len = line.text().len();
+            if len <= SPARE_TEXT && self.spare.len() < SPARE_LINES {
+                self.spare.push(line);
+            } else if len > SPARE_TEXT
+                && len <= SPARE_LONG_TEXT
+                && self.spare_long.len() < SPARE_LONG_LINES
+            {
+                self.spare_long.push(line);
+            }
+        }
+    }
+    /// Spare lines for a text of `text`'s lines: long ones for long lines.
+    fn spare_for(&mut self, text: &str) -> Vec<BufferLine> {
+        let lines = text.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let long = text.len() > lines * SPARE_TEXT;
+        let mut taken = Vec::with_capacity(lines);
+        for pool in if long {
+            [&mut self.spare_long, &mut self.spare]
+        } else {
+            [&mut self.spare, &mut self.spare_long]
+        } {
+            let keep = pool.len().saturating_sub(lines - taken.len());
+            taken.extend(pool.drain(keep..));
+        }
+        taken
     }
     /// Past a budget, drop the least recently used (never `keep`): shaped
     /// lines first, keeping measurements where the text has them.
@@ -736,13 +787,14 @@ impl TextCache {
                 }
                 let entry = self.entries.get_mut(&hash).expect("listed");
                 self.shaped_bytes -= entry.shaped_bytes();
-                entry.lines = None;
+                let lines = entry.lines.take();
                 entry.laid = None;
                 if entry.compact.is_none() {
                     // Nothing left to measure from.
                     self.compact_bytes -= entry.compact_bytes();
                     self.entries.remove(&hash);
                 }
+                self.recycle(lines);
             }
             self.recent.retain(|hash| self.entries.contains_key(hash));
         }
@@ -754,6 +806,7 @@ impl TextCache {
                 let entry = self.entries.remove(&hash).expect("listed");
                 self.shaped_bytes -= entry.shaped_bytes();
                 self.compact_bytes -= entry.compact_bytes();
+                self.recycle(entry.lines);
             }
             self.recent.retain(|hash| self.entries.contains_key(hash));
         }

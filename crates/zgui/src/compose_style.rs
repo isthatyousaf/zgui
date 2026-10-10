@@ -64,6 +64,84 @@ pub(crate) fn mount_style(
 
 /// Resolved styles, typography, intrinsic size and content layout target.
 type AppliedInputs = (Styles, Typography, Option<(f32, f32)>, Option<NodeId>);
+/// Paint properties an animation changes every frame: `Styles`' opacity,
+/// blur, edge fade, transform and text colour.
+#[derive(Clone, Copy, PartialEq)]
+struct Paint {
+    opacity: Option<f32>,
+    blur: Option<f32>,
+    edge_fade: Option<f32>,
+    transform: Option<crate::scene::Transform>,
+    text_color: Option<crate::scene::Color>,
+}
+impl Paint {
+    /// Take `styles`' paint properties out, leaving them unset.
+    fn take(styles: &mut Styles) -> Self {
+        Self {
+            opacity: styles.opacity.take(),
+            blur: styles.blur.take(),
+            edge_fade: styles.edge_fade.take(),
+            transform: styles.transform.take(),
+            text_color: styles.text_color.take(),
+        }
+    }
+    fn put(self, styles: &mut Styles) {
+        styles.opacity = self.opacity;
+        styles.blur = self.blur;
+        styles.edge_fade = self.edge_fade;
+        styles.transform = self.transform;
+        styles.text_color = self.text_color;
+    }
+    /// Which properties are set, whatever their values.
+    fn set(&self) -> [bool; 5] {
+        [
+            self.opacity.is_some(),
+            self.blur.is_some(),
+            self.edge_fade.is_some(),
+            self.transform.is_some(),
+            self.text_color.is_some(),
+        ]
+    }
+    /// `self` with what `over` sets laid over it, as `Styles::merge` does.
+    fn over(self, over: Self) -> Self {
+        Self {
+            opacity: over.opacity.or(self.opacity),
+            blur: over.blur.or(self.blur),
+            edge_fade: over.edge_fade.or(self.edge_fade),
+            transform: over.transform.or(self.transform),
+            text_color: over.text_color.or(self.text_color),
+        }
+    }
+    fn of(styles: &Styles) -> Self {
+        Self {
+            opacity: styles.opacity,
+            blur: styles.blur,
+            edge_fade: styles.edge_fade,
+            transform: styles.transform,
+            text_color: styles.text_color,
+        }
+    }
+}
+/// The inputs of the last full application besides paint: the dynamic
+/// styles without their paint properties, the interaction and disabled
+/// state, the inherited typography if it was read, the intrinsic size and
+/// layout target. A run that matches them changes paint alone.
+struct Settled {
+    dynamic: Option<Styles>,
+    paint: Option<[bool; 5]>,
+    state: Interaction,
+    disabled: bool,
+    parent: Option<Typography>,
+    intrinsic: Option<(f32, f32)>,
+    content: Option<NodeId>,
+}
+/// What a re-run compares against: the inputs last applied to the scene
+/// (unchanged results skip rebuilding and rewriting the node) and, for
+/// paint-only changes, the last full application's other inputs.
+struct Memo {
+    applied: Option<AppliedInputs>,
+    settled: Option<Settled>,
+}
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mount_style_with_intrinsic(
     ui: &mut Ui,
@@ -149,6 +227,15 @@ pub(crate) fn mount_style_with_intrinsic(
             });
         });
     }
+    // Most nodes have no variants: kept for the node's lifetime, each costs
+    // a pointer rather than a whole `Styles`.
+    let variants: [Option<Box<Styles>>; 4] = [
+        variants.hover,
+        variants.active,
+        variants.focus,
+        variants.disabled,
+    ]
+    .map(|v| v.map(Box::new));
     let weak = ui.downgrade();
     let original_style = ui.scene.borrow().style(node);
     let original_effects = ui.scene.borrow().effects(node);
@@ -156,17 +243,70 @@ pub(crate) fn mount_style_with_intrinsic(
     let original_isolated = ui.scene.borrow().is_isolated(node);
     let original_kind = ui.scene.borrow().kind(node).clone();
     let mut previous_disabled = None;
-    // The inputs last applied to the scene. Animations re-run this effect
-    // every frame; unchanged results skip rebuilding and rewriting the node.
-    let mut applied: Option<AppliedInputs> = None;
+    // What re-runs compare against, kept from a node's second run: most
+    // nodes are styled once, and each memo costs about 1.2 KB.
+    let mut memo: Option<Box<Memo>> = None;
+    let mut ran = false;
     ui.bind(node, move || {
         let Some(mut ui) = weak.upgrade() else { return };
         if !ui.scene.borrow().contains(node) { return; }
-        let mut resolved = base.clone();
-        if let Some(dynamic) = &mut dynamic { resolved.merge(&dynamic()); }
+        if std::mem::replace(&mut ran, true) && memo.is_none() {
+            memo = Some(Box::new(Memo { applied: None, settled: None }));
+        }
+        let mut produced = dynamic.as_mut().map(|dynamic| dynamic());
         let state = interaction.get();
         let is_disabled = disabled.as_mut().is_some_and(|read| read());
-        for (enabled, variant) in [(!is_disabled && state.hover, &variants.hover), (!is_disabled && (state.pointer_active || state.key_active.is_some()), &variants.active), (!is_disabled && state.focus, &variants.focus), (is_disabled, &variants.disabled)] {
+        let [hover, active, focus, disabled_variant] = &variants;
+        let active_variants = [(!is_disabled && state.hover, hover), (!is_disabled && (state.pointer_active || state.key_active.is_some()), active), (!is_disabled && state.focus, focus), (is_disabled, disabled_variant)];
+        // Animations re-run this every frame, mostly to change paint alone:
+        // when nothing else differs from the last full application, update
+        // just that, without resolving styles and typography again.
+        if let Some(Memo { applied: Some(applied), settled: Some(last) }) = memo.as_deref_mut()
+            && last.state == state
+            && last.disabled == is_disabled
+        {
+            let paint = produced.as_mut().map(Paint::take);
+            let unchanged = paint.map(|p| p.set()) == last.paint
+                && produced == last.dynamic
+                && last.parent.as_ref().is_none_or(|parent| inherited.with(|now| now == parent))
+                && intrinsic.as_ref().map(|size| size.get()) == last.intrinsic
+                && layout_target.as_ref().and_then(|target| target.get()) == last.content;
+            if unchanged {
+                let mut resolved = Paint::of(&base);
+                if let Some(paint) = paint { resolved = resolved.over(paint); }
+                for (enabled, variant) in active_variants {
+                    if enabled && let Some(variant) = variant { resolved = resolved.over(Paint::of(variant)); }
+                }
+                let parent_color = match &last.parent {
+                    Some(parent) => parent.color,
+                    None => inherited.with_untracked(|parent| parent.color),
+                };
+                let color = resolved.text_color.unwrap_or(parent_color);
+                resolved.put(&mut applied.0);
+                let mut effects = original_effects;
+                if let Some(value) = resolved.opacity { effects.opacity = value; }
+                if let Some(value) = resolved.blur { effects.blur_radius = value; }
+                if let Some(value) = resolved.edge_fade { effects.edge_fade = value; }
+                if applied.1.color != color {
+                    applied.1.color = color;
+                    output.update(|typography| typography.color = color);
+                }
+                let mut scene = ui.scene.borrow_mut();
+                scene.set_effects(node, effects);
+                scene.set_transform(node, resolved.transform.unwrap_or(original_transform));
+                if let NodeKind::Text { text, font_size, color: old } = scene.kind(node)
+                    && *old != color
+                {
+                    let kind = NodeKind::Text { text: text.clone(), color, font_size: *font_size };
+                    scene.set_kind(node, kind);
+                }
+                return;
+            }
+            if let (Some(produced), Some(paint)) = (&mut produced, paint) { paint.put(produced); }
+        }
+        let mut resolved = base.clone();
+        if let Some(produced) = &produced { resolved.merge(produced); }
+        for (enabled, variant) in active_variants {
             if enabled && let Some(variant) = variant { resolved.merge(variant); }
         }
         if disabled.is_some() && previous_disabled != Some(is_disabled) {
@@ -175,24 +315,42 @@ pub(crate) fn mount_style_with_intrinsic(
         }
         if let Some(output) = &object_fit { output.set(resolved.object_fit.unwrap_or_default()); }
         // Only observe inherited typography when a field is actually inherited.
-        let parent = if resolved.text_overflow.is_none() || resolved.line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.font_features.is_none() || resolved.text_align.is_none() || resolved.font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.letter_spacing.is_none() {
+        let tracks_parent = resolved.text_overflow.is_none() || resolved.line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.font_features.is_none() || resolved.text_align.is_none() || resolved.font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.letter_spacing.is_none();
+        let parent = if tracks_parent {
             inherited.get()
         } else {
             inherited.with_untracked(Clone::clone)
         };
+        let tracked_parent = tracks_parent.then(|| parent.clone());
         let current = Typography { display: crate::text_layout::TextOptions {overflow: resolved.text_overflow.unwrap_or(parent.display.overflow),line_clamp:resolved.line_clamp.unwrap_or(parent.display.line_clamp)}, color: resolved.text_color.unwrap_or(parent.color), size: resolved.text_size.unwrap_or(parent.size), wrap: resolved.text_wrap.unwrap_or(parent.wrap), font: crate::text_layout::FontStyle { family: resolved.font_family.clone().unwrap_or(parent.font.family), features: resolved.font_features.clone().unwrap_or(parent.font.features), align: resolved.text_align.unwrap_or(parent.font.align), fallbacks: resolved.font_fallbacks.clone().unwrap_or(parent.font.fallbacks), weight: resolved.font_weight.unwrap_or(parent.font.weight), italic: resolved.italic.unwrap_or(parent.font.italic), line_height: resolved.line_height.unwrap_or(parent.font.line_height), letter_spacing: resolved.letter_spacing.unwrap_or(parent.font.letter_spacing) } };
-        output.set(current.clone());
+        // Compare before cloning: unchanged typography notifies nothing.
+        if output.with_untracked(|old| *old != current) {
+            output.set(current.clone());
+        }
         // Read every remaining dependency before any early return so the
         // effect keeps its subscriptions.
         let intrinsic_size = intrinsic.as_ref().map(|size| size.get());
         let content_layout = layout_target.as_ref().and_then(|target| target.get());
+        if let Some(memo) = &mut memo {
+            let mut dynamic_rest = produced;
+            let paint = dynamic_rest.as_mut().map(|rest| Paint::take(rest).set());
+            memo.settled = Some(Settled {
+                dynamic: dynamic_rest,
+                paint,
+                state,
+                disabled: is_disabled,
+                parent: tracked_parent,
+                intrinsic: intrinsic_size,
+                content: content_layout,
+            });
+        }
         let inputs = (resolved, current, intrinsic_size, content_layout);
-        if applied.as_ref() == Some(&inputs) {
+        if memo.as_ref().is_some_and(|memo| memo.applied.as_ref() == Some(&inputs)) {
             return;
         }
         // Animations mostly change paint effects or the transform, which need
         // neither layout nor a new paint kind: update just those.
-        if let Some(previous) = &mut applied
+        if let Some(Memo { applied: Some(previous), .. }) = memo.as_deref_mut()
             && previous.1 == inputs.1
             && previous.2 == inputs.2
             && previous.3 == inputs.3
@@ -213,7 +371,11 @@ pub(crate) fn mount_style_with_intrinsic(
             }
             (previous.0.opacity, previous.0.blur, previous.0.edge_fade, previous.0.transform) = before;
         }
-        let (resolved, current, _, _) = &*applied.insert(inputs);
+        let mut first: Option<AppliedInputs> = None;
+        let (resolved, current, _, _) = match &mut memo {
+            Some(memo) => &*memo.applied.insert(inputs),
+            None => &*first.insert(inputs),
+        };
         let mut style = original_style.clone();
         if let Some(resolved_options) = &resolved.layout_options {
             if let Some(original) = &style.layout_options {
@@ -630,6 +792,58 @@ mod tests {
             settled,
             "MATRIX was reshaped {} times",
             calls.get() - settled
+        );
+    }
+    #[test]
+    fn animated_text_colour_repaints_without_layout() {
+        use crate::{compose::text, style::Styled};
+        let mut ui = Ui::new(300., 200.);
+        ui.scene
+            .borrow_mut()
+            .set_text_measurer(|text: &str, size: f32, _: Option<f32>| {
+                (text.len() as f32 * size, size)
+            });
+        let (alpha, size) = (ui.signal(90_u8), ui.signal(10_f32));
+        let (read_alpha, read_size) = (alpha.clone(), size.clone());
+        let view = ui.mount(text("shimmer").reactive_style(move || {
+            Styles::new()
+                .text_color(Color(255, 255, 255, read_alpha.get()))
+                .text_size(read_size.get())
+        }));
+        ui.scene.borrow_mut().flush();
+        // The text node, under whatever the view mounted around it.
+        let mut node = view.node();
+        while !matches!(ui.scene.borrow().kind(node), NodeKind::Text { .. }) {
+            node = ui.scene.borrow().children(node)[0];
+        }
+        let shown = |ui: &Ui| match ui.scene.borrow().kind(node) {
+            NodeKind::Text {
+                text,
+                color,
+                font_size,
+            } => (text.to_string(), *color, *font_size),
+            kind => panic!("expected text, found {kind:?}"),
+        };
+        let style = ui.scene.borrow().style(node);
+        alpha.set(200);
+        let report = ui.scene.borrow_mut().flush();
+        assert_eq!(
+            shown(&ui),
+            ("shimmer".into(), Color(255, 255, 255, 200), 10.)
+        );
+        assert_eq!(report.layout_nodes, 0);
+        assert!(!report.damage.is_empty());
+        assert_eq!(ui.scene.borrow().style(node), style);
+        // A size change still lays out, and colour changes keep applying after it.
+        size.set(20.);
+        let report = ui.scene.borrow_mut().flush();
+        assert!(report.layout_nodes > 0);
+        assert_eq!(ui.scene.borrow().bounds(node).width, 140.);
+        alpha.set(90);
+        ui.scene.borrow_mut().flush();
+        assert_eq!(
+            shown(&ui),
+            ("shimmer".into(), Color(255, 255, 255, 90), 20.)
         );
     }
     #[test]

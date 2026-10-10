@@ -205,3 +205,24 @@ fn damage_limited_rendering_matches_a_fresh_render_after_every_mutation() {
         assert_eq!(differing, 0, "{differing} pixels differ after step {step}");
     }
 }
+
+/// Plain frames encoded with Metal directly (macOS) draw exactly the pixels
+/// of the same frames encoded through wgpu.
+#[test]
+fn direct_metal_frames_match_wgpu_frames() {
+    let (mut scene, tree) = build();
+    let mut direct = GpuRenderer::new(W as u32, H as u32).expect("GPU adapter");
+    let context = direct.context();
+    let mut wgpu = GpuRenderer::new_with_context(W as u32, H as u32, &context).unwrap();
+    wgpu.set_direct_metal(false);
+    for step in 0..40 {
+        let report = scene.flush();
+        direct.render(&scene, &report.damage).unwrap();
+        wgpu.render(&scene, &report.damage).unwrap();
+        assert!(
+            direct.readback().unwrap() == wgpu.readback().unwrap(),
+            "frame {step} differs"
+        );
+        mutate(&mut scene, &tree, step);
+    }
+}

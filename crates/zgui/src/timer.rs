@@ -1,4 +1,8 @@
 //! Shared deadline scheduler. Sleeping tasks do not poll or allocate a thread per timer.
+//!
+//! A scheduler thread fires timers unless an event loop [`host`]s them: then
+//! the loop fires them as it wakes for its own deadlines, and a timer costs no
+//! thread wake-ups or cross-thread messages.
 use std::{
     collections::BTreeMap,
     future::Future,
@@ -10,58 +14,153 @@ use std::{
     task::{Context, Poll, Waker},
     time::{Duration, Instant},
 };
+type Wake = Arc<dyn Fn() + Send + Sync>;
 struct Driver {
     waiters: Mutex<BTreeMap<(Instant, u64), Waker>>,
     changed: Condvar,
     next: AtomicU64,
+    host: Mutex<Host>,
+}
+#[derive(Default)]
+struct Host {
+    /// Wakes the event loop hosting the timers: see [`host`].
+    wake: Option<Wake>,
+    /// The scheduler thread is running.
+    thread: bool,
 }
 fn driver() -> &'static Arc<Driver> {
     static DRIVER: OnceLock<Arc<Driver>> = OnceLock::new();
     DRIVER.get_or_init(|| {
-        let driver = Arc::new(Driver {
+        Arc::new(Driver {
             waiters: Mutex::new(BTreeMap::new()),
             changed: Condvar::new(),
             next: AtomicU64::new(1),
-        });
-        let shared = driver.clone();
-        std::thread::Builder::new()
-            .name("zgui-timers".into())
-            .stack_size(128 * 1024)
-            .spawn(move || {
-                loop {
-                    let mut waiters = shared.waiters.lock().unwrap();
-                    loop {
-                        let Some((&(deadline, _), _)) = waiters.first_key_value() else {
-                            waiters = shared.changed.wait(waiters).unwrap();
-                            continue;
-                        };
-                        let now = Instant::now();
-                        if deadline > now {
-                            waiters = shared
-                                .changed
-                                .wait_timeout(waiters, deadline - now)
-                                .unwrap()
-                                .0;
-                            continue;
-                        }
-                        let mut ready = Vec::new();
-                        while waiters
-                            .first_key_value()
-                            .is_some_and(|((deadline, _), _)| *deadline <= now)
-                        {
-                            ready.push(waiters.pop_first().unwrap().1);
-                        }
-                        drop(waiters);
-                        for waker in ready {
-                            waker.wake();
-                        }
-                        break;
+            host: Mutex::default(),
+        })
+    })
+}
+impl Driver {
+    /// The earliest deadline changed: wake whoever fires timers.
+    fn notify(self: &Arc<Self>) {
+        let (wake, spawn) = {
+            let mut host = self.host.lock().unwrap();
+            let spawn = host.wake.is_none() && !host.thread;
+            host.thread |= spawn;
+            (host.wake.clone(), spawn)
+        };
+        if let Some(wake) = wake {
+            wake();
+        } else if spawn {
+            let shared = self.clone();
+            std::thread::Builder::new()
+                .name("zgui-timers".into())
+                .stack_size(128 * 1024)
+                .spawn(move || shared.run())
+                .expect("create timer scheduler");
+        } else {
+            self.changed.notify_one();
+        }
+    }
+    fn host(self: &Arc<Self>, wake: Wake) -> Hosted {
+        self.host.lock().unwrap().wake = Some(wake.clone());
+        // The thread checks for a host under the waiters lock before it waits.
+        drop(self.waiters.lock().unwrap());
+        self.changed.notify_all();
+        Hosted {
+            driver: self.clone(),
+            wake,
+        }
+    }
+    /// The scheduler thread: fires timers until an event loop hosts them.
+    fn run(&self) {
+        loop {
+            let mut waiters = self.waiters.lock().unwrap();
+            loop {
+                {
+                    let mut host = self.host.lock().unwrap();
+                    if host.wake.is_some() {
+                        host.thread = false;
+                        return;
                     }
                 }
-            })
-            .expect("create timer scheduler");
-        driver
-    })
+                let Some((&(deadline, _), _)) = waiters.first_key_value() else {
+                    waiters = self.changed.wait(waiters).unwrap();
+                    continue;
+                };
+                let now = Instant::now();
+                if deadline > now {
+                    waiters = self
+                        .changed
+                        .wait_timeout(waiters, deadline - now)
+                        .unwrap()
+                        .0;
+                    continue;
+                }
+                let ready = due(&mut waiters, now);
+                drop(waiters);
+                for waker in ready {
+                    waker.wake();
+                }
+                break;
+            }
+        }
+    }
+}
+fn due(waiters: &mut BTreeMap<(Instant, u64), Waker>, now: Instant) -> Vec<Waker> {
+    let mut ready = Vec::new();
+    while waiters
+        .first_key_value()
+        .is_some_and(|((deadline, _), _)| *deadline <= now)
+    {
+        ready.push(waiters.pop_first().unwrap().1);
+    }
+    ready
+}
+/// Fire timers from an event loop instead of the scheduler thread, while the
+/// returned [`Hosted`] lives. The loop calls [`Hosted::fire`] as it wakes and
+/// waits no later than [`Hosted::deadline`]. `wake` must wake the loop: it
+/// runs when a sleep becomes the earliest deadline, which a loop that reads
+/// the deadline after its own work only needs from other threads.
+pub fn host(wake: impl Fn() + Send + Sync + 'static) -> Hosted {
+    driver().host(Arc::new(wake))
+}
+/// An event loop's hold on the timers: see [`host`]. Dropping it returns them
+/// to the scheduler thread.
+pub struct Hosted {
+    driver: Arc<Driver>,
+    wake: Wake,
+}
+impl Hosted {
+    /// Wake every sleep whose deadline has passed.
+    pub fn fire(&self) {
+        let ready = due(&mut self.driver.waiters.lock().unwrap(), Instant::now());
+        for waker in ready {
+            waker.wake();
+        }
+    }
+    /// The earliest pending deadline.
+    pub fn deadline(&self) -> Option<Instant> {
+        let waiters = self.driver.waiters.lock().unwrap();
+        waiters
+            .first_key_value()
+            .map(|(&(deadline, _), _)| deadline)
+    }
+}
+impl Drop for Hosted {
+    fn drop(&mut self) {
+        let mut host = self.driver.host.lock().unwrap();
+        if host
+            .wake
+            .as_ref()
+            .is_some_and(|wake| Arc::ptr_eq(wake, &self.wake))
+        {
+            host.wake = None;
+            drop(host);
+            if !self.driver.waiters.lock().unwrap().is_empty() {
+                self.driver.notify();
+            }
+        }
+    }
 }
 #[must_use = "Futures do nothing unless awaited or polled"]
 pub struct Sleep {
@@ -96,15 +195,26 @@ impl Future for Sleep {
         // Waker clone/drop may execute user code. Keep both outside the
         // scheduler lock, including replacing a task's previous waker.
         let next = cx.waker().clone();
-        let removed = {
+        let key = (self.deadline, *id);
+        let (removed, earliest) = {
             let mut waiters = d.waiters.lock().unwrap();
-            match waiters.get(&(self.deadline, *id)) {
-                Some(w) if w.will_wake(&next) => Some(next),
-                _ => waiters.insert((self.deadline, *id), next),
+            match waiters.get(&key) {
+                Some(w) if w.will_wake(&next) => (Some(next), false),
+                Some(_) => (waiters.insert(key, next), false),
+                None => {
+                    waiters.insert(key, next);
+                    (
+                        None,
+                        waiters.first_key_value().is_some_and(|(k, _)| *k == key),
+                    )
+                }
             }
         };
         drop(removed);
-        d.changed.notify_one();
+        // Only an earlier deadline changes when timers must fire next.
+        if earliest {
+            d.notify();
+        }
         Poll::Pending
     }
 }
@@ -113,7 +223,6 @@ impl Drop for Sleep {
         if let Some((d, id)) = self.registration.take() {
             let removed = d.waiters.lock().unwrap().remove(&(self.deadline, id));
             drop(removed);
-            d.changed.notify_one();
         }
     }
 }
@@ -153,6 +262,71 @@ mod tests {
 }
 
 #[cfg(test)]
+mod hosted_tests {
+    use super::*;
+    use std::{sync::atomic::AtomicUsize, task::Wake};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    #[test]
+    fn hosted_timers_fire_from_the_loop_and_return_to_the_thread() {
+        let driver = Arc::new(Driver {
+            waiters: Mutex::new(BTreeMap::new()),
+            changed: Condvar::new(),
+            next: AtomicU64::new(1),
+            host: Mutex::default(),
+        });
+        let woken = Arc::new(AtomicUsize::new(0));
+        let hosted = driver.host(Arc::new({
+            let woken = woken.clone();
+            move || {
+                woken.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        let waker = Waker::from(count.clone());
+        let mut cx = Context::from_waker(&waker);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut first = Sleep {
+            deadline,
+            registration: Some((driver.clone(), 1)),
+        };
+        assert!(Pin::new(&mut first).poll(&mut cx).is_pending());
+        // The earliest deadline wakes the hosting loop; no thread starts.
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        assert!(!driver.host.lock().unwrap().thread);
+        assert_eq!(hosted.deadline(), Some(deadline));
+        // A later one changes nothing the loop waits for.
+        let mut later = Sleep {
+            deadline: deadline + Duration::from_millis(20),
+            registration: Some((driver.clone(), 2)),
+        };
+        assert!(Pin::new(&mut later).poll(&mut cx).is_pending());
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        hosted.fire();
+        assert_eq!(count.0.load(Ordering::SeqCst), 0, "not yet due");
+        std::thread::sleep(
+            deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(1),
+        );
+        hosted.fire();
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        assert!(Pin::new(&mut first).poll(&mut cx).is_ready());
+        // Without a host, the thread fires what remains.
+        drop(hosted);
+        assert!(driver.host.lock().unwrap().thread);
+        let end = Instant::now() + Duration::from_secs(2);
+        while count.0.load(Ordering::SeqCst) < 2 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(count.0.load(Ordering::SeqCst), 2);
+        assert!(Pin::new(&mut later).poll(&mut cx).is_ready());
+    }
+}
+
+#[cfg(test)]
 mod waker_cleanup_tests {
     use super::*;
     use std::{
@@ -187,6 +361,7 @@ mod waker_cleanup_tests {
                 waiters: Mutex::new(BTreeMap::new()),
                 changed: Condvar::new(),
                 next: AtomicU64::new(2),
+                host: Mutex::default(),
             });
             let locked = Arc::new(AtomicBool::new(false));
             let dropped = Arc::new(AtomicBool::new(false));

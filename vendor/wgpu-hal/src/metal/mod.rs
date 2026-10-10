@@ -633,8 +633,10 @@ impl crate::Queue for Queue {
 
             // zgui patch: hand presentation off to the last buffer's
             // scheduled handler (registered before commit, as Metal requires).
+            // Only submissions that draw to a drawable present one: others
+            // skip the handler and its callback.
             let handoff = Arc::new(PresentHandoff::default());
-            {
+            if !_surface_textures.is_empty() {
                 let last = command_buffers
                     .iter()
                     .rev()
@@ -664,7 +666,8 @@ impl crate::Queue for Queue {
             if let Some(raw) = extra_command_buffer {
                 raw.commit();
             }
-            *self.shared.last_committed.lock() = Some(handoff);
+            *self.shared.last_committed.lock() =
+                (!_surface_textures.is_empty()).then_some(handoff);
         });
         Ok(())
     }

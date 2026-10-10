@@ -1,0 +1,12 @@
+[package]
+name = "cosmic-text-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Checks the zgui cosmic-text patch against upstream: identical layouts, and shaping time"
+
+[dependencies]
+upstream = { package = "cosmic-text", version = "=0.19.0", features = ["shape-run-cache"] }
+patched = { package = "cosmic-text", path = "..", features = ["shape-run-cache"] }
+
+[workspace]

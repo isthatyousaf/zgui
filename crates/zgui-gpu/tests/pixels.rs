@@ -4930,9 +4930,10 @@ fn sliding_stream_keeps_prepared_text_to_what_is_drawn() {
     assert!(peak < 1024 * 1024, "prepared text grew to {peak} bytes");
 }
 
-/// Software rasterizers draw plain quads with a lighter shader, and opaque
-/// flat ones without blending (see `debug_split_shading`); every feature
-/// must look the same either way.
+/// Plain quads draw with a lighter shader, and opaque flat ones without
+/// blending (every run on a software rasterizer, large ones on a GPU; see
+/// `debug_split_shading`): every feature must look the same either way, to
+/// the byte.
 #[test]
 fn split_shading_matches_the_full_shader() {
     let _gpu_fixture = gpu_fixture();
@@ -5031,7 +5032,65 @@ fn split_shading_matches_the_full_shader() {
         .max()
         .unwrap();
     // Premultiplied samples round once less: at most one step.
-    assert!(worst <= 1, "split shading differs by up to {worst}");
+    assert_eq!(worst, 0, "split shading differs by up to {worst}");
+}
+
+/// Opaque rounded and bordered panels draw a flat interior with the basic
+/// shader and only their edge bands with the full one: the same bytes as one
+/// quad, at fractional positions and sizes, per-corner radii and any scale.
+#[test]
+fn split_panels_match_whole_panels() {
+    let _gpu_fixture = gpu_fixture();
+    use zgui::{compose::prelude::*, widgets::Ui};
+    let view = || {
+        overlay()
+            .w(320.)
+            .h(240.)
+            .bg(rgb(0x14161c))
+            .children((0..24).map(|i| {
+                let f = i as f32;
+                let panel = div()
+                    .absolute()
+                    .ml(4.3 + (i % 6) as f32 * 52.7)
+                    .mt(5.6 + (i / 6) as f32 * 57.9)
+                    .w(40. + (f * 1.37) % 9.)
+                    .h(36. + (f * 2.11) % 13.)
+                    .bg(rgb(0x2a2f3a + i * 0x030507));
+                match i % 4 {
+                    0 => panel.rounded(6. + f % 5.),
+                    1 => panel.rounded(3.5).border(1.).border_color(rgb(0x99aabb)),
+                    2 => panel.border(2.5).border_color(rgba(0xffcc8880)),
+                    _ => panel.rounded_corners(zgui::decoration::Corners {
+                        top_left: 10.,
+                        top_right: 0.,
+                        bottom_right: 4.5,
+                        bottom_left: 7.,
+                    }),
+                }
+                .child(text("x").text_size(9.))
+            }))
+    };
+    for scale in [1., 1.5, 2.] {
+        let render = |split: bool| {
+            let mut gpu = GpuRenderer::new((320. * scale) as u32, (240. * scale) as u32).unwrap();
+            gpu.set_scale_factor(scale);
+            gpu.debug_split_shading(split);
+            let mut ui = Ui::new(320., 240.);
+            gpu.install_text(&mut ui.scene.borrow_mut());
+            ui.mount(view());
+            ui.prepare_frame();
+            let damage = ui.scene.borrow_mut().flush().damage;
+            gpu.render(&ui.scene.borrow(), &damage).unwrap();
+            gpu.readback().unwrap()
+        };
+        let (whole, split) = (render(false), render(true));
+        let differing = whole
+            .chunks(4)
+            .zip(split.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        assert_eq!(differing, 0, "{differing} pixels differ at scale {scale}");
+    }
 }
 
 /// Changing text repaints where its glyphs land, not its whole box, and

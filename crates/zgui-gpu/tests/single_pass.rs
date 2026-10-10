@@ -364,3 +364,84 @@ fn blur_frames_defer_the_tail_after_the_last_filter_and_still_match() {
     }
     assert!(blurred >= 11, "the moving content must damage the glass");
 }
+
+#[test]
+fn whole_window_frames_skip_the_retained_target_and_still_match() {
+    // A window repainted whole frame after frame (a live dashboard) is drawn
+    // into the drawable alone; a partial frame after that repaints everything
+    // to bring the retained target back. Every presented frame must match
+    // the two-pass route.
+    fn scene() -> (Scene, NodeId, NodeId) {
+        let mut scene = Scene::new(240., 160.);
+        scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+        let background = scene.append(
+            scene.root(),
+            NodeKind::Rect(Color(16, 20, 28, 255)),
+            fixed(240., 160.),
+        );
+        let card = scene.append(
+            scene.root(),
+            NodeKind::Panel {
+                layout: Layout::Overlay,
+                quad: QuadStyle {
+                    fill: Color(60, 90, 140, 255),
+                    radius: 6.,
+                    ..Default::default()
+                },
+            },
+            fixed(60., 30.),
+        );
+        scene.set_transform(card, Transform { x: 20., y: 20. });
+        (scene, background, card)
+    }
+    let mut reference = GpuRenderer::new(480, 320).expect("a Metal/Vulkan adapter");
+    let mut single = GpuRenderer::new(480, 320).unwrap();
+    for renderer in [&mut reference, &mut single] {
+        renderer.set_scale_factor(2.);
+        renderer.set_background(Color(12, 14, 20, 255));
+    }
+    single.debug_enable_single_pass();
+    let (mut a, a_background, a_card) = scene();
+    let (mut b, b_background, b_card) = scene();
+    // Whole-window frames, partial ones, whole again, then partial.
+    let whole = |n: usize| matches!(n, 1..=5 | 9..=11);
+    for n in 0..16_usize {
+        for (scene, background, card) in [
+            (&mut a, a_background, a_card),
+            (&mut b, b_background, b_card),
+        ] {
+            if whole(n) {
+                let v = (n * 9) as u8;
+                scene.set_kind(background, NodeKind::Rect(Color(16 + v, 20, 28, 255)));
+            } else if n > 0 {
+                scene.set_transform(
+                    card,
+                    Transform {
+                        x: 20. + n as f32 * 4.,
+                        y: 20.,
+                    },
+                );
+            }
+        }
+        let damage = a.flush().damage;
+        reference.render(&a, &damage).unwrap();
+        let expected = reference.debug_present_offscreen().unwrap();
+        let damage = b.flush().damage;
+        single.render(&b, &damage).unwrap();
+        let presented = single.debug_present_offscreen().unwrap();
+        let differing = presented
+            .iter()
+            .zip(&expected)
+            .filter(|(p, e)| p != e)
+            .count();
+        assert_eq!(
+            differing, 0,
+            "frame {n}: {differing} presented bytes differ"
+        );
+    }
+    // Frames 1-5 (the first frame repaints whole too) and 10-11 follow a
+    // whole-window frame.
+    assert_eq!(single.debug_direct_frames(), 7);
+    // Once a partial frame has repainted it, the retained target is current.
+    assert_eq!(single.readback().unwrap(), reference.readback().unwrap());
+}

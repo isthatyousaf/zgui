@@ -7,13 +7,20 @@
 //! issues two tiny buffer blits while creating every device. Here those
 //! operations run as vertex-only render passes instead: rasterization is off
 //! and each vertex writes one 32-bit word of the destination.
+//!
+//! Each pass renders to a 1x1 texture it neither loads nor stores. Two passes
+//! without attachments (or with memoryless ones) in one command buffer make
+//! the driver keep a second set of six 512 KB regions for good: 3 MB, against
+//! none for passes with a real attachment.
 
 use objc2::{rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::NSString;
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions, MTLDevice, MTLLibrary,
-    MTLPrimitiveType, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-    MTLRenderPipelineState,
+    MTLBuffer, MTLColorWriteMask, MTLCommandBuffer, MTLCommandEncoder, MTLCompileOptions,
+    MTLDevice, MTLLibrary, MTLLoadAction, MTLPixelFormat, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
+    MTLRenderPipelineState, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
+    MTLTextureUsage,
 };
 
 const SOURCE: &str = "
@@ -27,6 +34,7 @@ vertex void zgui_copy(device uint* dst [[buffer(0)]], const device uint* src [[b
 pub(super) struct BufferWrites {
     fill: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
     copy: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+    target: Retained<ProtocolObject<dyn MTLTexture>>,
 }
 
 impl BufferWrites {
@@ -43,13 +51,27 @@ impl BufferWrites {
             let descriptor = MTLRenderPipelineDescriptor::new();
             descriptor.setVertexFunction(Some(&function));
             descriptor.setRasterizationEnabled(false);
+            let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+            color.setPixelFormat(MTLPixelFormat::R8Unorm);
+            color.setWriteMask(MTLColorWriteMask::empty());
             device
                 .newRenderPipelineStateWithDescriptor_error(&descriptor)
                 .ok()
         };
+        let target = unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                MTLPixelFormat::R8Unorm,
+                1,
+                1,
+                false,
+            )
+        };
+        target.setUsage(MTLTextureUsage::RenderTarget);
+        target.setStorageMode(MTLStorageMode::Private);
         Some(Self {
             fill: pipeline("zgui_fill")?,
             copy: pipeline("zgui_copy")?,
+            target: device.newTextureWithDescriptor(&target)?,
         })
     }
 
@@ -63,9 +85,10 @@ impl BufferWrites {
         size: u64,
     ) {
         let descriptor = MTLRenderPassDescriptor::new();
-        descriptor.setRenderTargetWidth(1);
-        descriptor.setRenderTargetHeight(1);
-        descriptor.setDefaultRasterSampleCount(1);
+        let color = unsafe { descriptor.colorAttachments().objectAtIndexedSubscript(0) };
+        color.setTexture(Some(&self.target));
+        color.setLoadAction(MTLLoadAction::DontCare);
+        color.setStoreAction(MTLStoreAction::DontCare);
         let encoder = cmd_buf
             .renderCommandEncoderWithDescriptor(&descriptor)
             .unwrap();

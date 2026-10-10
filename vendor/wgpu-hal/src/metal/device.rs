@@ -1847,16 +1847,12 @@ impl crate::Device for super::Device {
 
     unsafe fn create_fence(&self) -> DeviceResult<super::Fence> {
         self.counters.fences.add(1);
-        // https://developer.apple.com/documentation/metal/mtlsharedevent
-        let shared_event = if available!(macos = 10.14, ios = 12.0, tvos = 12.0, visionos = 1.0) {
-            self.shared.device.newSharedEvent() // This should be supported on said devices, but some sandbox environments may still restrict it, making it return `None`.
-        } else {
-            None
-        };
+        // zgui patch: no shared event. Only `Fence::raw_shared_event` interop
+        // reads it, and signalling it costs every submission kernel work.
         Ok(super::Fence {
             completed_value: Arc::new(atomic::AtomicU64::new(0)),
             pending_command_buffers: Vec::new(),
-            shared_event,
+            shared_event: None,
         })
     }
 
@@ -1895,6 +1891,13 @@ impl crate::Device for super::Device {
             }
         };
 
+        // zgui patch: without a timeout, block until the command buffer
+        // completes rather than polling it every millisecond: a caller waiting
+        // to present wakes as the GPU finishes, not up to 1 ms later.
+        if timeout.is_none() {
+            cmd_buf.waitUntilCompleted();
+            return Ok(true);
+        }
         let start = time::Instant::now();
         loop {
             if let MTLCommandBufferStatus::Completed = cmd_buf.status() {

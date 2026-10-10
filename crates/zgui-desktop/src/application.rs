@@ -80,6 +80,8 @@ enum Event {
     #[cfg(target_os = "macos")]
     NativeMenuAction(crate::MenuAction),
     Wake(u64),
+    /// A sleep on another thread is now the earliest timer: see `zgui::timer::host`.
+    Timers,
     Redraw(u64),
     /// A native display refresh (macOS; other platforms use timers).
     #[cfg(target_os = "macos")]
@@ -567,6 +569,16 @@ impl Application {
         let token = handle.token;
         let mut root = Host::new(self.options, handle, factory.clone());
         build(&mut root.context);
+        // Timers fire as the loop wakes for its own deadlines, without a
+        // scheduler thread waking it with a message per timer.
+        let timers = {
+            let (wake, ui_thread) = (proxy.clone(), std::thread::current().id());
+            zgui::timer::host(move || {
+                if std::thread::current().id() != ui_thread {
+                    let _ = wake.send_event(Event::Timers);
+                }
+            })
+        };
         let mut host = WindowManager {
             #[cfg(target_os = "linux")]
             native_files: None,
@@ -580,6 +592,7 @@ impl Application {
             factory,
             active: false,
             error: None,
+            timers,
         };
         event_loop.run_app(&mut host)?;
         if let Some(e) = host.error.take() {
@@ -637,6 +650,14 @@ struct Host {
     frames: FrameClock,
     #[cfg(target_os = "macos")]
     display_link: Option<crate::frame_source::DisplayLink>,
+    /// When the display link last delivered a refresh, aligning `frame_timer`
+    /// to its grid: until `VSYNC_RESYNC` later the timer paces frames and the
+    /// link (a thread spinning to each refresh) stays stopped.
+    #[cfg(target_os = "macos")]
+    vsync_synced: Option<std::time::Instant>,
+    /// Frames are wanted and the aligned timer paces them.
+    #[cfg(target_os = "macos")]
+    vsync_paced: bool,
     frame_timer: crate::frame_source::FrameTimer,
     frame_interval: std::time::Duration,
     /// A display refresh arrived since the last paint. While the display link
@@ -770,6 +791,10 @@ impl Host {
             frames,
             #[cfg(target_os = "macos")]
             display_link: None,
+            #[cfg(target_os = "macos")]
+            vsync_synced: None,
+            #[cfg(target_os = "macos")]
+            vsync_paced: false,
             frame_arrived: false,
             trim_at: None,
             startup_trim: StartupTrim::Pending,
@@ -1358,6 +1383,8 @@ impl Host {
         #[cfg(target_os = "macos")]
         {
             self.display_link = None;
+            self.vsync_synced = None;
+            self.vsync_paced = false;
         }
         self.frame_deadline = None;
         self.frame_heartbeat = None;
@@ -1663,10 +1690,11 @@ impl Host {
             self.tasks.tick();
         }
         #[cfg(target_os = "macos")]
-        let paced = self
-            .display_link
-            .as_ref()
-            .is_some_and(|link| link.running());
+        let paced = self.vsync_paced
+            || self
+                .display_link
+                .as_ref()
+                .is_some_and(|link| link.running());
         #[cfg(not(target_os = "macos"))]
         let paced = false;
         // Scene damage accumulates until the refresh paints it in one frame.
@@ -1733,17 +1761,47 @@ impl Host {
         }
         #[cfg(target_os = "macos")]
         if let Some(link) = &mut self.display_link {
-            link.set_running(wanted);
+            let refresh = 1. / self.frame_interval.as_secs_f64();
+            // Scrolling always runs at the display's full rate.
+            let rate = self
+                .frames
+                .demanded_rate(refresh)
+                .filter(|rate| !scrolling && *rate < refresh - 0.5);
+            // Animating at the display's rate, the link paces every frame:
+            // locked to the display, frames reach the window server one a
+            // refresh, where a timer's wake-ups wander by milliseconds and
+            // leave some refreshes without a new frame. Otherwise (slower
+            // updates, scrolling) a timer paces them on the grid the link last
+            // reported, and the link (a thread spinning to each refresh) runs
+            // again only to resync.
+            let animating = wanted && rate.is_none() && !scrolling;
+            if let Some(renderer) = &mut self.renderer {
+                renderer.set_full_rate(wanted && rate.is_none());
+            }
+            let synced = !animating
+                && self
+                    .vsync_synced
+                    .is_some_and(|at| now.duration_since(at) < crate::frame_source::VSYNC_RESYNC);
+            let timed = wanted && synced;
+            if timed && !self.vsync_paced {
+                // The link's watchdog deadline, if any, is not a refresh.
+                self.frame_deadline = None;
+            }
+            self.vsync_paced = timed;
+            link.set_running(wanted && !synced);
             if wanted {
-                let refresh = 1. / self.frame_interval.as_secs_f64();
-                // Scrolling always runs at the display's full rate.
-                link.set_preferred_rate(
-                    self.frames
-                        .demanded_rate(refresh)
-                        .filter(|rate| !scrolling && *rate < refresh - 0.5),
-                );
-                let heartbeat = *self.frame_heartbeat.get_or_insert(now);
-                self.frame_deadline = Some(heartbeat + crate::frame_source::WATCHDOG);
+                if timed {
+                    if self.frame_deadline.is_none() {
+                        // Whole refreshes apart, as the link spaces them.
+                        let every = rate.map_or(1., |rate| (refresh / rate - 1e-6).ceil().max(1.));
+                        let interval = self.frame_interval.mul_f64(every);
+                        self.frame_deadline = Some(self.frame_timer.next_deadline(now, interval));
+                    }
+                } else {
+                    link.set_preferred_rate(rate);
+                    let heartbeat = *self.frame_heartbeat.get_or_insert(now);
+                    self.frame_deadline = Some(heartbeat + crate::frame_source::WATCHDOG);
+                }
             }
             return;
         }
@@ -1837,6 +1895,7 @@ struct WindowManager {
     factory: WindowFactory,
     active: bool,
     error: Option<String>,
+    timers: zgui::timer::Hosted,
 }
 impl WindowManager {
     fn menu_action(&mut self, token: u64, action: crate::MenuAction) {
@@ -2113,11 +2172,17 @@ impl ApplicationHandler<Event> for WindowManager {
             Event::Wake(token) => {
                 let _ = self.hosts.get(&token);
             }
+            Event::Timers => {}
             #[cfg(target_os = "macos")]
             Event::Frame(token, frame) => {
                 if let Some(host) = self.hosts.get_mut(&token)
                     && !host.context.window.is_closed()
                 {
+                    // The refresh after this one starts as this one shows.
+                    host.frame_timer =
+                        crate::frame_source::FrameTimer::aligned(frame.time, frame.index + 1);
+                    host.frame_interval = frame.interval;
+                    host.vsync_synced = Some(std::time::Instant::now());
                     // `about_to_wait` runs next in this same loop pass, stepping
                     // the woken animations and painting once.
                     host.deliver_frame(frame);
@@ -2174,8 +2239,13 @@ impl ApplicationHandler<Event> for WindowManager {
             event_loop.exit();
             return;
         }
+        // Wake tasks whose sleeps are due before the hosts poll them.
+        self.timers.fire();
         if !self.active {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            event_loop.set_control_flow(match self.timers.deadline() {
+                Some(deadline) => ControlFlow::WaitUntil(deadline),
+                None => ControlFlow::Wait,
+            });
             return;
         }
         if let Err(e) = self.create_pending(event_loop) {
@@ -2244,6 +2314,7 @@ impl ApplicationHandler<Event> for WindowManager {
                 ]
             })
             .flatten()
+            .chain(self.timers.deadline())
             .min();
         event_loop.set_control_flow(if ready {
             ControlFlow::Poll
@@ -2399,7 +2470,7 @@ fn check_damage(
     frame: u64,
 ) -> Result<(), zgui_gpu::GpuError> {
     let partial = renderer.readback()?;
-    renderer.render(scene, full)?;
+    renderer.render_uncounted(scene, full)?;
     let fresh = renderer.readback()?;
     let mut stale: Option<(usize, usize, usize, usize)> = None;
     let mut count = 0;
@@ -2595,6 +2666,7 @@ mod tests {
             factory,
             active: false,
             error: None,
+            timers: zgui::timer::host(|| {}),
         };
         assert!(retained.clipboard.borrow().is_some());
         drop(manager);

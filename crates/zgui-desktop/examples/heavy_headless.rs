@@ -1,0 +1,104 @@
+//! The heavy dashboard (see zgui_workload::heavy) offscreen: the windowed
+//! `heavy_workload`'s view at a Retina scale, ticked as fast as it renders,
+//! reporting CPU per tick by phase, damage and renderer memory.
+//! Run: ZGUI_MODE=both TICKS=900 cargo run --release -p zgui-desktop --example heavy_headless
+//! (`SCALE` sets the device scale, 2 by default.)
+use std::time::{Duration, Instant};
+use zgui::widgets::Ui;
+use zgui_gpu::GpuRenderer;
+use zgui_workload::{Mode, heavy::*};
+
+#[path = "support/heavy_view.rs"]
+mod view;
+
+fn env<T: std::str::FromStr>(name: &str, default: T) -> T {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn main() {
+    let ticks: usize = env("TICKS", 900);
+    let scale: f32 = env("SCALE", 2.);
+    let mut work = Heavy::from_env();
+    let mode = work.mode;
+    let mut gpu = GpuRenderer::new(
+        (WIDTH * scale).round() as u32,
+        (HEIGHT * scale).round() as u32,
+    )
+    .expect("GPU");
+    gpu.set_scale_factor(scale);
+    let mut ui = Ui::new(WIDTH, HEIGHT);
+    gpu.install_text(&mut ui.scene.borrow_mut());
+    let live = ui.signal(0_u64);
+    let scroll = ui.signal(0_f32);
+    let log = ui.signal(work.visible_log());
+    ui.mount(view::dashboard(live.clone(), scroll.clone(), log.clone()));
+    let (mut update, mut layout, mut render) = (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+    let (mut damaged, mut nodes) = (0_u64, 0_usize);
+    for tick in 0..ticks {
+        let started = Instant::now();
+        if tick > 0 {
+            work.tick();
+            ui.runtime.batch(|| {
+                if matches!(mode, Mode::Stream | Mode::Both) {
+                    live.set(work.live);
+                    log.set(work.visible_log());
+                }
+                if matches!(mode, Mode::Scroll | Mode::Both) {
+                    scroll.set(work.scroll);
+                }
+            });
+        }
+        let updated = Instant::now();
+        ui.prepare_frame();
+        let report = ui.scene.borrow_mut().flush();
+        let laid = Instant::now();
+        let stats = gpu.render(&ui.scene.borrow(), &report.damage).unwrap();
+        // A window presents every frame; readback only settles the GPU.
+        if tick % 60 == 0 {
+            gpu.readback().unwrap();
+        }
+        let done = Instant::now();
+        if tick >= 60 {
+            update += updated - started;
+            layout += laid - updated;
+            render += done - laid;
+            damaged += stats.damaged_pixels;
+            nodes += report.layout_nodes;
+        }
+    }
+    let measured = (ticks - 60).max(1) as f64;
+    let ms = |d: Duration| d.as_secs_f64() * 1e3 / measured;
+    let mb = |bytes: usize| bytes as f64 / 1048576.;
+    let caches = gpu.debug_cache_stats();
+    let prepared = gpu.text_cache().borrow().bytes();
+    let text_cache = gpu.text_cache();
+    let (shaped, hits) = {
+        let cache = text_cache.borrow();
+        (cache.shaped, cache.hits)
+    };
+    println!(
+        "{mode:?}: update {:.3} + layout {:.3} + render {:.3} = {:.3} ms/tick, \
+         layout nodes {:.0}/tick, damaged {:.2} Mpx/tick, scene nodes {}, \
+         atlas {:.1} MB, images {:.1} MB, shaped {:.1} MB, prepared {:.1}+{:.1} MB, device {:.1} MB, \
+         texts shaped {:.1}/tick, cache hits {:.1}/tick",
+        ms(update),
+        ms(layout),
+        ms(render),
+        ms(update + layout + render),
+        nodes as f64 / measured,
+        damaged as f64 / measured / 1e6,
+        ui.scene.borrow().len(),
+        mb(caches.atlas_bytes),
+        mb(caches.image_bytes),
+        mb(caches.shaped_bytes),
+        mb(prepared.0),
+        mb(prepared.1),
+        gpu.debug_device_allocated_bytes()
+            .map_or(0., |b| b as f64 / 1048576.),
+        shaped as f64 / ticks as f64,
+        hits as f64 / ticks as f64,
+    );
+}

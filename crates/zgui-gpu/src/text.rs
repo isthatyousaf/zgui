@@ -214,7 +214,7 @@ impl ShapedText {
         let text = text.into();
         let size = font_size.max(1.);
         let line_height = font.line_height.resolve(size);
-        let mut buffer = Buffer::new(fonts, Metrics::new(size, line_height));
+        let mut buffer = Buffer::new_empty(Metrics::new(size, line_height));
         buffer.set_size(width, None);
         set_buffer_text(fonts, &mut buffer, &text, font, size);
         // Editors need a visual row for the caret after a final line ending;
@@ -620,10 +620,7 @@ impl CpuTextRaster {
         font: &zgui::text_layout::FontStyle,
     ) -> Vec<(i32, i32, cosmic_text::SwashImage)> {
         let size = size.max(1.);
-        let mut buffer = Buffer::new(
-            &mut self.fonts,
-            Metrics::new(size, font.line_height.resolve(size)),
-        );
+        let mut buffer = Buffer::new_empty(Metrics::new(size, font.line_height.resolve(size)));
         buffer.set_size(Some(width), Some(height));
         set_buffer_text(&mut self.fonts, &mut buffer, text, font, size);
         buffer.shape_until_scroll(&mut self.fonts, false);
@@ -1090,10 +1087,10 @@ pub fn rich_buffer(
         if content.is_empty()
             && let Some(run) = rich.runs().first()
         {
-            let mut buffer = Buffer::new(
-                fonts,
-                Metrics::new(run.font_size, run.font.line_height.resolve(run.font_size)),
-            );
+            let mut buffer = Buffer::new_empty(Metrics::new(
+                run.font_size,
+                run.font.line_height.resolve(run.font_size),
+            ));
             buffer.set_size(width, None);
             set_buffer_text(fonts, &mut buffer, "", &run.font, run.font_size);
             buffer.shape_until_scroll(fonts, false);
@@ -1161,7 +1158,7 @@ fn rich_buffer_raw(
     height: Option<f32>,
     ellipsis: bool,
 ) -> Buffer {
-    let mut buffer = rich_buffer_unshaped(fonts, rich, ellipsis);
+    let mut buffer = rich_buffer_unshaped(fonts, rich, ellipsis, Vec::new());
     buffer.set_size(width, height);
     buffer.shape_until_scroll(fonts, false);
     buffer
@@ -1169,14 +1166,18 @@ fn rich_buffer_raw(
 
 /// `rich`'s lines and span attributes, not yet shaped or laid out.
 /// Plain text's lines as `ShapedText::with_font` builds them, not yet shaped.
+/// `recycled`: lines whose allocations (text, shapes, layout) the buffer's
+/// lines reuse, as a buffer reuses its own when its text is set again.
 pub(crate) fn plain_buffer_unshaped(
     fonts: &mut FontSystem,
     text: &str,
     font_size: f32,
     font: &zgui::text_layout::FontStyle,
+    recycled: Vec<cosmic_text::BufferLine>,
 ) -> Buffer {
     let size = font_size.max(1.);
-    let mut buffer = Buffer::new(fonts, Metrics::new(size, font.line_height.resolve(size)));
+    let mut buffer = Buffer::new_empty(Metrics::new(size, font.line_height.resolve(size)));
+    buffer.lines = recycled;
     set_buffer_text(fonts, &mut buffer, text, font, size);
     buffer
 }
@@ -1184,11 +1185,13 @@ pub(crate) fn rich_buffer_unshaped(
     fonts: &mut FontSystem,
     rich: &zgui::rich_text::RichText,
     ellipsis: bool,
+    recycled: Vec<cosmic_text::BufferLine>,
 ) -> Buffer {
     let base = rich.runs().first();
     let size = base.map_or(1., |run| run.font_size.max(1.));
     let line_height = base.map_or(1., |run| run.font.line_height.resolve(size));
-    let mut buffer = Buffer::new(fonts, Metrics::new(size, line_height));
+    let mut buffer = Buffer::new_empty(Metrics::new(size, line_height));
+    buffer.lines = recycled;
     let default_font = zgui::text_layout::FontStyle::default();
     let default_attrs = attrs(base.map_or(&default_font, |run| &run.font), size);
     let mut spans = Vec::new();

@@ -1,0 +1,14 @@
+[package]
+name = "zgui-compare-gpui-fast"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[dependencies]
+# longbridge/gpui-fast: Zed's GPUI with retained views, layout and text.
+gpui = { package = "gpui-fast", version = "=0.1.4" }
+# font-kit: the macOS text system; without it no text draws.
+gpui_platform = { package = "gpui-fast-platform", version = "=0.1.4", features = ["font-kit"] }
+zgui-workload = { path = "../workload" }
+[profile.release]
+lto = "thin"
+codegen-units = 1

@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/zgui", "crates/zgui-desktop", "crates/zgui-gpu", "comparisons/workload"]
-exclude = ["comparisons/gpui", "comparisons/quickgui"]
+exclude = ["comparisons/gpui", "comparisons/quickgui", "vendor/cosmic-text"]
 resolver = "2"
 
 [workspace.package]
@@ -20,5 +20,10 @@ codegen-units = 1
 # empty ones are never committed. Upstream opens several per submission; each
 # costs a commit, a completion callback and Core Animation frame-pacing IPC.
 # See vendor/wgpu-hal/ZGUI_PATCH.md.
+#
+# cosmic-text with a shaping patch: cached words are looked up without building
+# a key per word, and plain ASCII lines skip bidi analysis. Text shaping is the
+# largest share of CPU when text streams. See vendor/cosmic-text/ZGUI_PATCH.md.
 [patch.crates-io]
 wgpu-hal = { path = "vendor/wgpu-hal" }
+cosmic-text = { path = "vendor/cosmic-text" }

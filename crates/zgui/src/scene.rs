@@ -10,6 +10,103 @@ pub struct NodeId {
     index: u32,
     generation: u32,
 }
+/// Separate damage rectangles a flush keeps before marking damage on a grid
+/// of `DAMAGE_CELL` cells instead (see `DamageGrid`).
+const DAMAGE_RECTS: usize = 64;
+/// The side of a damage grid cell, in viewport units.
+const DAMAGE_CELL: f32 = 8.;
+/// Damage past `DAMAGE_RECTS` separate places (a busy dashboard changes
+/// hundreds a frame): marking cells costs the same however many there are,
+/// where merging into a list scans it each time. Rectangles again at flush.
+struct DamageGrid {
+    columns: usize,
+    rows: usize,
+    cells: Vec<bool>,
+    marked: usize,
+}
+impl DamageGrid {
+    fn new(viewport: Rect) -> Self {
+        let columns = (viewport.width / DAMAGE_CELL).ceil().max(1.) as usize;
+        let rows = (viewport.height / DAMAGE_CELL).ceil().max(1.) as usize;
+        Self {
+            columns,
+            rows,
+            cells: vec![false; columns * rows],
+            marked: 0,
+        }
+    }
+    /// The cells `rect` touches: columns and rows, end exclusive.
+    fn span(&self, rect: Rect) -> (usize, usize, usize, usize) {
+        let first = |value: f32| (value / DAMAGE_CELL).floor().max(0.) as usize;
+        let end =
+            |value: f32, count: usize| ((value / DAMAGE_CELL).ceil().max(0.) as usize).min(count);
+        (
+            first(rect.x).min(self.columns),
+            first(rect.y).min(self.rows),
+            end(rect.x + rect.width, self.columns),
+            end(rect.y + rect.height, self.rows),
+        )
+    }
+    fn mark(&mut self, rect: Rect) {
+        let (left, top, right, bottom) = self.span(rect);
+        for row in top..bottom {
+            for cell in &mut self.cells[row * self.columns + left..row * self.columns + right] {
+                self.marked += usize::from(!*cell);
+                *cell = true;
+            }
+        }
+    }
+    fn touches(&self, rect: Rect) -> bool {
+        let (left, top, right, bottom) = self.span(rect);
+        (top..bottom).any(|row| {
+            self.cells[row * self.columns + left..row * self.columns + right].contains(&true)
+        })
+    }
+    fn full(&self) -> bool {
+        self.marked == self.cells.len()
+    }
+    /// Each row's runs of marked cells, a run repeated straight down the
+    /// next rows joining them as one rectangle.
+    fn rects(&self, viewport: Rect) -> Vec<Rect> {
+        let mut done = Vec::new();
+        // Runs still growing down: first and end column, first row.
+        let (mut open, mut next) = (Vec::<(usize, usize, usize)>::new(), Vec::new());
+        for row in 0..=self.rows {
+            let cells = if row < self.rows {
+                &self.cells[row * self.columns..(row + 1) * self.columns]
+            } else {
+                &[][..]
+            };
+            let mut column = 0;
+            while column < cells.len() {
+                if !cells[column] {
+                    column += 1;
+                    continue;
+                }
+                let start = column;
+                while column < cells.len() && cells[column] {
+                    column += 1;
+                }
+                let top = open
+                    .iter()
+                    .find(|(left, right, _)| (*left, *right) == (start, column))
+                    .map_or(row, |run| run.2);
+                next.push((start, column, top));
+            }
+            for &(left, right, top) in &open {
+                if !next.iter().any(|run| (run.0, run.1) == (left, right)) {
+                    let cell = |index: usize| index as f32 * DAMAGE_CELL;
+                    let rect =
+                        Rect::new(cell(left), cell(top), cell(right - left), cell(row - top));
+                    done.extend(rect.intersection(viewport));
+                }
+            }
+            std::mem::swap(&mut open, &mut next);
+            next.clear();
+        }
+        done
+    }
+}
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -248,6 +345,9 @@ pub struct Style {
 const LAYOUT: u8 = 1;
 const PAINT: u8 = 2;
 const COMPOSITE: u8 = 4;
+/// Repainted where its damage is already recorded: layout damaged a node it
+/// moved where it was and where it lands (see `arrange`).
+const PAINTED: u8 = 8;
 struct Node {
     cursor: Option<crate::cursor::Cursor>,
     parent: Option<NodeId>,
@@ -276,7 +376,8 @@ struct Node {
     /// measures a leaf under several constraint sets per pass, which defeats
     /// `measurement`; this keeps an unchanged label from being reshaped each
     /// time an ancestor relayouts. Cleared by the node's own layout invalidation.
-    text_size: TextSizes,
+    /// Damage fills it too (see `text_ink`), for text whose box is fixed.
+    text_size: std::cell::Cell<TextSizes>,
     advanced_layout: Option<Box<advanced_layout::AdvancedLayoutCache>>,
     arrange_dirty: bool,
     isolated: bool,
@@ -293,7 +394,7 @@ struct TextSizes([Option<TextSize>; 3]);
 /// A wrap limit, the shaper revision it was measured under, and the size.
 type TextSize = (Option<f32>, u64, (f32, f32));
 impl TextSizes {
-    fn get(&self, limit: Option<f32>, revision: u64) -> Option<(f32, f32)> {
+    fn find(&self, limit: Option<f32>, revision: u64) -> Option<(f32, f32)> {
         self.0
             .iter()
             .flatten()
@@ -303,6 +404,11 @@ impl TextSizes {
     fn insert(&mut self, limit: Option<f32>, revision: u64, size: (f32, f32)) {
         self.0.rotate_right(1);
         self.0[0] = Some((limit, revision, size));
+    }
+    fn remember(cell: &std::cell::Cell<Self>, limit: Option<f32>, revision: u64, size: (f32, f32)) {
+        let mut sizes = cell.get();
+        sizes.insert(limit, revision, size);
+        cell.set(sizes);
     }
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -415,6 +521,11 @@ pub struct Scene {
     root: NodeId,
     dirty: Vec<NodeId>,
     damage: Vec<Rect>,
+    /// The last rectangles added to `damage` (each is held by one of its
+    /// rectangles, which only grow): a change damages the same places again
+    /// and again (before and after, then where layout moves it).
+    recent_damage: [Rect; 4],
+    damage_grid: Option<DamageGrid>,
     viewport: Rect,
     blur_nodes: Vec<NodeId>,
     isolation_count: usize,
@@ -429,6 +540,9 @@ pub struct Scene {
     layout_revision: u64,
     layout_pass: u64,
     content_revision: u64,
+    /// The deepest stack and the item count of the last paint walk
+    /// (`layer_items_within`): the next one starts at those sizes.
+    walk_hints: std::cell::Cell<(usize, usize)>,
     /// Dirty fixed-size containers whose ancestors stayed clean.
     layout_roots: Vec<NodeId>,
     geometry_revision: u64,
@@ -487,7 +601,7 @@ impl Scene {
                     alternates: Vec::new(),
                     ink: std::cell::Cell::new(None),
                     ink_valid: std::cell::Cell::new(false),
-                    text_size: TextSizes::default(),
+                    text_size: Default::default(),
                     advanced_layout: None,
                     arrange_dirty: true,
                     isolated: false,
@@ -499,6 +613,8 @@ impl Scene {
             root,
             dirty: vec![root],
             damage: Vec::new(),
+            recent_damage: [Rect::default(); 4],
+            damage_grid: None,
             viewport: Rect::new(0.0, 0.0, width, height),
             blur_nodes: Vec::new(),
             pending_moves: Vec::new(),
@@ -516,6 +632,7 @@ impl Scene {
             layout_revision: 0,
             layout_pass: 0,
             content_revision: 0,
+            walk_hints: Default::default(),
             layout_roots: Vec::new(),
             geometry_revision: 0,
             cursor_styles: 0,
@@ -1003,7 +1120,7 @@ impl Scene {
             alternates: Vec::new(),
             ink: std::cell::Cell::new(None),
             ink_valid: std::cell::Cell::new(false),
-            text_size: TextSizes::default(),
+            text_size: Default::default(),
             advanced_layout: None,
             arrange_dirty: true,
             isolated: false,
@@ -1086,7 +1203,7 @@ impl Scene {
             *text = value;
         }
         // Sizes of the old text; a fixed box skips relayout, not these.
-        node.text_size = TextSizes::default();
+        node.text_size.set(TextSizes::default());
         self.invalidate(id, PAINT);
         if !fixed {
             self.invalidate_layout(id);
@@ -1106,16 +1223,31 @@ impl Scene {
                 style.layout_options = Some(Arc::new(normalized));
             }
         }
-        if self.node(id).style == style {
+        let old = &self.node(id).style;
+        if *old == style {
             return;
         }
-        self.damage_subtree(id);
+        // Fields that only place and size nodes paint nothing themselves:
+        // layout repaints what they move (`arrange` damages a node whose
+        // bounds change, where it was and where it lands).
+        let paints = old.clip != style.clip
+            || old.fade_edges != style.fade_edges
+            || old.padding != style.padding
+            || old.padding_edges != style.padding_edges
+            || old.text_wrap != style.text_wrap
+            || old.text_options != style.text_options
+            || old.layout_options != style.layout_options;
+        if paints {
+            self.damage_subtree(id);
+        }
         if own_visible(&self.node(id).style) != own_visible(&style) {
             self.geometry_revision = self.geometry_revision.wrapping_add(1);
         }
         self.node_mut(id).style = style;
-        self.damage_subtree(id);
-        self.invalidate(id, PAINT);
+        if paints {
+            self.damage_subtree(id);
+            self.invalidate(id, PAINT);
+        }
         self.invalidate_layout(id);
     }
     pub fn resize(&mut self, width: f32, height: f32) {
@@ -1127,6 +1259,9 @@ impl Scene {
         style.width = Some(width);
         style.height = Some(height);
         self.set_style(self.root, style);
+        // Everything repaints; a grid would be the old size.
+        self.damage_grid = None;
+        self.damage.clear();
         self.add_damage(self.viewport);
     }
     /// Set a translation, normalizing each non-finite coordinate to zero.
@@ -1204,7 +1339,7 @@ impl Scene {
             let mut current = Some(id);
             while let Some(ancestor) = current {
                 let node = self.node_mut(ancestor);
-                if node.isolated && (ancestor != id || flags & (LAYOUT | PAINT) != 0) {
+                if node.isolated && (ancestor != id || flags & (LAYOUT | PAINT | PAINTED) != 0) {
                     node.layer_revision = node.layer_revision.wrapping_add(1);
                 }
                 current = node.parent;
@@ -1221,7 +1356,7 @@ impl Scene {
         let node = self.node_mut(id);
         node.dirty |= flags;
         if flags & LAYOUT != 0 {
-            node.text_size = TextSizes::default();
+            node.text_size.set(TextSizes::default());
         }
         if !node.queued {
             node.queued = true;
@@ -1272,6 +1407,12 @@ impl Scene {
         }
         depth
     }
+    /// Whether this frame already repaints the whole viewport: more damage
+    /// changes nothing, so callers skip working out where it would be.
+    fn damage_is_full(&self) -> bool {
+        self.damage.first() == Some(&self.viewport)
+            || self.damage_grid.as_ref().is_some_and(DamageGrid::full)
+    }
     fn add_damage(&mut self, rect: Rect) {
         // Raster coverage rounds fractional edges outwards. Quantize before merging
         // so adjacent subpixel rectangles cannot repaint the same alpha pixel twice,
@@ -1285,6 +1426,21 @@ impl Scene {
         let Some(mut rect) = rect.intersection(self.viewport) else {
             return;
         };
+        let holds = |outer: &Rect| {
+            outer.x <= rect.x
+                && outer.y <= rect.y
+                && outer.x + outer.width >= rect.x + rect.width
+                && outer.y + outer.height >= rect.y + rect.height
+        };
+        if self.recent_damage.iter().any(holds) {
+            return;
+        }
+        self.recent_damage.rotate_right(1);
+        self.recent_damage[0] = rect;
+        if let Some(grid) = &mut self.damage_grid {
+            grid.mark(rect);
+            return;
+        }
         let mut index = 0;
         while index < self.damage.len() {
             if self.damage[index].intersects(rect) {
@@ -1295,10 +1451,12 @@ impl Scene {
             }
         }
         self.damage.push(rect);
-        // Bound fragmentation: many independent writes are cheaper as one surface update.
-        if self.damage.len() > 64 {
-            self.damage.clear();
-            self.damage.push(self.viewport);
+        if self.damage.len() > DAMAGE_RECTS {
+            let mut grid = DamageGrid::new(self.viewport);
+            for rect in self.damage.drain(..) {
+                grid.mark(rect);
+            }
+            self.damage_grid = Some(grid);
         }
     }
     fn world(&self, id: NodeId) -> (Rect, Effects, Option<Rect>) {
@@ -1341,7 +1499,7 @@ impl Scene {
         (bounds, effects, clip)
     }
     fn damage_subtree(&mut self, id: NodeId) {
-        if !self.shown(id) {
+        if self.damage_is_full() || !self.shown(id) {
             return;
         }
         // Resolve the ancestors once, then carry translation and clipping down
@@ -1358,7 +1516,7 @@ impl Scene {
         // repaint yet (a mounting row styles each node before its first
         // layout, which damages where it lands). Nor are its descendants.
         let unplaced = node.measurement.is_none() && node.bounds == Rect::default();
-        if !own_visible(&node.style) || unplaced {
+        if !own_visible(&node.style) || unplaced || self.damage_is_full() {
             return;
         }
         let transform = Transform {
@@ -1453,6 +1611,7 @@ impl Scene {
         let revision = self.text_shaper_revision;
         let cached = node
             .text_size
+            .get()
             .0
             .iter()
             .flatten()
@@ -1461,11 +1620,21 @@ impl Scene {
                     && match (limit, measured) {
                         (None, None) => true,
                         (Some(width), None) => size.0 <= width,
-                        (Some(width), Some(measured)) => *measured >= width && size.0 <= width,
+                        (Some(width), Some(measured)) => {
+                            *measured == width || (*measured >= width && size.0 <= width)
+                        }
                         (None, Some(_)) => false,
                     };
                 same.then_some(*size)
             });
+        // Measured here, the size serves this node's next damage too: a box
+        // of fixed size is not measured by layout.
+        let remember = |size: (f32, f32)| {
+            if cached.is_none() {
+                TextSizes::remember(&node.text_size, limit, revision, size);
+            }
+            size
+        };
         let rtl = |text: &str| {
             text.chars().any(|c| {
                 matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF | 0x1E800..=0x1EFFF)
@@ -1479,10 +1648,10 @@ impl Scene {
                 if rtl(text) || (self.font_measurer.is_none() && self.font_shaper.is_none()) {
                     return bounds;
                 }
-                let size = cached.unwrap_or_else(|| match &self.font_measurer {
+                let size = remember(cached.unwrap_or_else(|| match &self.font_measurer {
                     Some(measure) => measure(text, *font_size, limit, &node.font),
                     None => self.measure_text_with_font(text, *font_size, limit, &node.font),
-                });
+                }));
                 let line = node.font.line_height.resolve(*font_size);
                 (size, *font_size, line, node.font.align)
             }
@@ -1493,8 +1662,9 @@ impl Scene {
                 {
                     return bounds;
                 }
-                let size =
-                    cached.unwrap_or_else(|| self.rich_measurer.measure_mounted(text, limit));
+                let size = remember(
+                    cached.unwrap_or_else(|| self.rich_measurer.measure_mounted(text, limit)),
+                );
                 let font_size = text
                     .runs()
                     .iter()
@@ -1542,7 +1712,7 @@ impl Scene {
         true
     }
     fn damage_node(&mut self, id: NodeId) {
-        if !self.shown(id) {
+        if self.damage_is_full() || !self.shown(id) {
             return;
         }
         let (bounds, effects, clip) = self.world(id);
@@ -1642,7 +1812,7 @@ impl Scene {
                     .then_some(available_w)
                     .flatten();
                 let revision = self.text_shaper_revision;
-                if let Some(size) = self.node(id).text_size.get(limit, revision) {
+                if let Some(size) = self.node(id).text_size.get().find(limit, revision) {
                     size
                 } else {
                     let size = if style.text_options != Default::default() {
@@ -1667,7 +1837,7 @@ impl Scene {
                             None => self.measure_text_with_font(&text, font_size, limit, font),
                         }
                     };
-                    self.node_mut(id).text_size.insert(limit, revision, size);
+                    TextSizes::remember(&self.node(id).text_size, limit, revision, size);
                     size
                 }
             }
@@ -1678,11 +1848,11 @@ impl Scene {
                 // Same cache as plain text: colour-only changes keep layout
                 // (see `set_kind`), so they keep this size too.
                 let revision = self.text_shaper_revision;
-                if let Some(size) = self.node(id).text_size.get(limit, revision) {
+                if let Some(size) = self.node(id).text_size.get().find(limit, revision) {
                     size
                 } else {
                     let size = self.rich_measurer.measure_mounted(&text, limit);
-                    self.node_mut(id).text_size.insert(limit, revision, size);
+                    TextSizes::remember(&self.node(id).text_size, limit, revision, size);
                     size
                 }
             }
@@ -2042,7 +2212,7 @@ impl Scene {
         }
         if changed {
             self.node_mut(id).bounds = bounds;
-            self.invalidate(id, PAINT);
+            self.invalidate(id, PAINTED);
         }
         for ((child, rect), constraints) in children.into_iter().zip(child_constraints) {
             // Cached: promotes the matching result; evicted: re-measures.
@@ -2126,8 +2296,10 @@ impl Scene {
                 continue;
             }
             let flags = self.node(*id).dirty;
-            if flags & PAINT != 0 {
+            if flags & (PAINT | PAINTED) != 0 {
                 report.paint_nodes += 1;
+            }
+            if flags & PAINT != 0 {
                 self.damage_node(*id);
             }
             if flags & COMPOSITE != 0 {
@@ -2140,7 +2312,7 @@ impl Scene {
         self.dirty = dirty;
         self.dirty.clear();
         // Backdrop-filter output depends on pixels behind it, even when its own node is clean.
-        if !self.damage.is_empty() && !self.blur_nodes.is_empty() {
+        if (!self.damage.is_empty() || self.damage_grid.is_some()) && !self.blur_nodes.is_empty() {
             let mut blur_regions: Vec<(Rect, bool)> = self
                 .blur_nodes
                 .iter()
@@ -2154,7 +2326,11 @@ impl Scene {
             loop {
                 let mut changed = false;
                 for (rect, processed) in &mut blur_regions {
-                    if !*processed && self.damage.iter().any(|damage| damage.intersects(*rect)) {
+                    let touched = match &self.damage_grid {
+                        Some(grid) => grid.touches(*rect),
+                        None => self.damage.iter().any(|damage| damage.intersects(*rect)),
+                    };
+                    if !*processed && touched {
                         self.add_damage(*rect);
                         *processed = true;
                         changed = true;
@@ -2166,7 +2342,12 @@ impl Scene {
             }
         }
         self.resolve_moves();
-        report.damage = std::mem::take(&mut self.damage);
+        report.damage = match self.damage_grid.take() {
+            Some(grid) if grid.full() => vec![self.viewport],
+            Some(grid) => grid.rects(self.viewport),
+            None => std::mem::take(&mut self.damage),
+        };
+        self.recent_damage = Default::default();
         if !report.damage.is_empty() || !self.moves.is_empty() {
             self.flush_serial += 1;
             for scroll in &mut self.moves {
@@ -2415,8 +2596,12 @@ impl Scene {
         } else {
             Some(self.viewport)
         };
-        let mut stack = vec![(start, transform, 1., clip, None::<(Rect, [f32; 2])>)];
-        let mut result = Vec::new();
+        // Sized as the last walk was, rather than grown from nothing each frame.
+        let (stack_hint, items_hint) = self.walk_hints.get();
+        let mut stack = Vec::with_capacity(stack_hint.max(1));
+        stack.push((start, transform, 1., clip, None::<(Rect, [f32; 2])>));
+        let mut result = Vec::with_capacity(items_hint);
+        let mut deepest = 0;
         while let Some((id, parent_transform, parent_opacity, parent_clip, mask)) = stack.pop() {
             let node = self.node(id);
             let transform = Transform {
@@ -2447,6 +2632,7 @@ impl Scene {
                         .filter(|child| touches(self.ink(**child), transform))
                         .map(|child| (*child, transform, effects.opacity, clip, child_mask)),
                 );
+                deepest = deepest.max(stack.len());
             }
             result.push(PaintItem {
                 isolated,
@@ -2460,6 +2646,7 @@ impl Scene {
                 mask,
             });
         }
+        self.walk_hints.set((deepest, result.len()));
         result
     }
     pub fn paint_items(&self) -> impl Iterator<Item = PaintItem<'_>> {
@@ -2657,7 +2844,7 @@ mod tests {
         );
         let mut sizes = TextSizes::default();
         for limit in [Some(100.), Some(200.), Some(100.), Some(200.)] {
-            if sizes.get(limit, 0).is_none() {
+            if sizes.find(limit, 0).is_none() {
                 sizes.insert(limit, 0, (1., 1.));
             }
         }

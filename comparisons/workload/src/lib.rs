@@ -453,7 +453,7 @@ pub mod heavy {
         format!("{:.2} MB/s", 0.2 + 48. * sample(row + 3000, live))
     }
     pub fn row_color(row: usize) -> u32 {
-        if row % 2 == 0 {
+        if row.is_multiple_of(2) {
             PANEL
         } else {
             STRIPE
