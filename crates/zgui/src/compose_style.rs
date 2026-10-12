@@ -15,12 +15,14 @@ pub(crate) struct Typography {
     pub wrap: bool,
     pub font: crate::text_layout::FontStyle,
 }
+/// Styles laid over a node's own while it is hovered, active, focused or
+/// disabled. Boxed: most views set none, and every view carries the set.
 #[derive(Default)]
 pub(crate) struct Variants {
-    pub hover: Option<Styles>,
-    pub active: Option<Styles>,
-    pub focus: Option<Styles>,
-    pub disabled: Option<Styles>,
+    pub hover: Option<Box<Styles>>,
+    pub active: Option<Box<Styles>>,
+    pub focus: Option<Box<Styles>>,
+    pub disabled: Option<Box<Styles>>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum ActivationKey {
@@ -156,8 +158,19 @@ pub(crate) fn mount_style_with_intrinsic(
     layout_target: Option<Signal<Option<NodeId>>>,
     object_fit: Option<Signal<crate::style::ObjectFit>>,
 ) -> Signal<Typography> {
-    let typography = ui.signal(inherited.with_untracked(Clone::clone));
-    let output = typography.clone();
+    // A node setting no typography (nor through a variant or a dynamic
+    // style) shows its parent's: it passes that signal on, not a copy.
+    let own = dynamic.is_some()
+        || base.sets_typography()
+        || [&variants.hover, &variants.active, &variants.focus, &variants.disabled]
+            .into_iter()
+            .any(|variant| variant.as_deref().is_some_and(Styles::sets_typography));
+    let typography = if own {
+        ui.signal(inherited.with_untracked(Clone::clone))
+    } else {
+        inherited.clone()
+    };
+    let output = own.then(|| typography.clone());
     let interaction = ui.signal(Interaction::default());
     if interactive
         || variants.hover.is_some()
@@ -227,15 +240,12 @@ pub(crate) fn mount_style_with_intrinsic(
             });
         });
     }
-    // Most nodes have no variants: kept for the node's lifetime, each costs
-    // a pointer rather than a whole `Styles`.
     let variants: [Option<Box<Styles>>; 4] = [
         variants.hover,
         variants.active,
         variants.focus,
         variants.disabled,
-    ]
-    .map(|v| v.map(Box::new));
+    ];
     let weak = ui.downgrade();
     let original_style = ui.scene.borrow().style(node);
     let original_effects = ui.scene.borrow().effects(node);
@@ -289,7 +299,9 @@ pub(crate) fn mount_style_with_intrinsic(
                 if let Some(value) = resolved.edge_fade { effects.edge_fade = value; }
                 if applied.1.color != color {
                     applied.1.color = color;
-                    output.update(|typography| typography.color = color);
+                    if let Some(output) = &output {
+                        output.update(|typography| typography.color = color);
+                    }
                 }
                 let mut scene = ui.scene.borrow_mut();
                 scene.set_effects(node, effects);
@@ -315,16 +327,24 @@ pub(crate) fn mount_style_with_intrinsic(
         }
         if let Some(output) = &object_fit { output.set(resolved.object_fit.unwrap_or_default()); }
         // Only observe inherited typography when a field is actually inherited.
-        let tracks_parent = resolved.text_overflow.is_none() || resolved.line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.font_features.is_none() || resolved.text_align.is_none() || resolved.font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.letter_spacing.is_none();
+        let tracks_parent = resolved.rare().text_overflow.is_none() || resolved.rare().line_clamp.is_none() || resolved.text_color.is_none() || resolved.text_size.is_none() || resolved.text_wrap.is_none() || resolved.font_family.is_none() || resolved.rare().font_features.is_none() || resolved.text_align.is_none() || resolved.rare().font_fallbacks.is_none() || resolved.font_weight.is_none() || resolved.italic.is_none() || resolved.line_height.is_none() || resolved.rare().letter_spacing.is_none();
         let parent = if tracks_parent {
             inherited.get()
         } else {
             inherited.with_untracked(Clone::clone)
         };
-        let tracked_parent = tracks_parent.then(|| parent.clone());
-        let current = Typography { display: crate::text_layout::TextOptions {overflow: resolved.text_overflow.unwrap_or(parent.display.overflow),line_clamp:resolved.line_clamp.unwrap_or(parent.display.line_clamp)}, color: resolved.text_color.unwrap_or(parent.color), size: resolved.text_size.unwrap_or(parent.size), wrap: resolved.text_wrap.unwrap_or(parent.wrap), font: crate::text_layout::FontStyle { family: resolved.font_family.clone().unwrap_or(parent.font.family), features: resolved.font_features.clone().unwrap_or(parent.font.features), align: resolved.text_align.unwrap_or(parent.font.align), fallbacks: resolved.font_fallbacks.clone().unwrap_or(parent.font.fallbacks), weight: resolved.font_weight.unwrap_or(parent.font.weight), italic: resolved.italic.unwrap_or(parent.font.italic), line_height: resolved.line_height.unwrap_or(parent.font.line_height), letter_spacing: resolved.letter_spacing.unwrap_or(parent.font.letter_spacing) } };
+        // Nothing of its own (the usual dynamic style: sizes, colours): the
+        // parent's typography, as it is.
+        let current = if !resolved.sets_typography() {
+            parent.clone()
+        } else {
+            Typography { display: crate::text_layout::TextOptions {overflow: resolved.rare().text_overflow.unwrap_or(parent.display.overflow),line_clamp:resolved.rare().line_clamp.unwrap_or(parent.display.line_clamp)}, color: resolved.text_color.unwrap_or(parent.color), size: resolved.text_size.unwrap_or(parent.size), wrap: resolved.text_wrap.unwrap_or(parent.wrap), font: crate::text_layout::FontStyle { family: resolved.font_family.clone().unwrap_or_else(|| parent.font.family.clone()), features: resolved.rare().font_features.clone().unwrap_or_else(|| parent.font.features.clone()), align: resolved.text_align.unwrap_or(parent.font.align), fallbacks: resolved.rare().font_fallbacks.clone().unwrap_or_else(|| parent.font.fallbacks.clone()), weight: resolved.font_weight.unwrap_or(parent.font.weight), italic: resolved.italic.unwrap_or(parent.font.italic), line_height: resolved.line_height.unwrap_or(parent.font.line_height), letter_spacing: resolved.rare().letter_spacing.unwrap_or(parent.font.letter_spacing) } }
+        };
+        let tracked_parent = tracks_parent.then_some(parent);
         // Compare before cloning: unchanged typography notifies nothing.
-        if output.with_untracked(|old| *old != current) {
+        if let Some(output) = &output
+            && output.with_untracked(|old| *old != current)
+        {
             output.set(current.clone());
         }
         // Read every remaining dependency before any early return so the
@@ -387,7 +407,8 @@ pub(crate) fn mount_style_with_intrinsic(
             }
         }
         macro_rules! field { ($($field:ident),* $(,)?) => { $(if let Some(value) = resolved.$field { style.$field = value; })* }; }
-        macro_rules! dimension { ($($field:ident),* $(,)?) => { $(if let Some(value) = resolved.$field { style.$field = Some(value); })* }; }
+        let rare = resolved.rare();
+        macro_rules! dimension { ($($field:ident),* $(,)?) => { $(if let Some(value) = rare.$field { style.$field = Some(value); })* }; }
         dimension!(min_width,max_width,min_height,max_height);
         if resolved.width.is_some() || resolved.width_percent.is_some() {
             style.width = resolved.width;
@@ -397,7 +418,8 @@ pub(crate) fn mount_style_with_intrinsic(
             style.height = resolved.height;
             style.height_percent = resolved.height_percent;
         }
-        field!(absolute,gap,clip,fade_edges,flex_grow,flex_shrink,align,justify,text_wrap,margin);
+        field!(absolute,gap,clip,flex_grow,flex_shrink,align,justify,text_wrap,margin);
+        if let Some(value) = rare.fade_edges { style.fade_edges = value; }
         if matches!(original_kind, NodeKind::Text { .. } | NodeKind::RichText { .. }) { style.text_wrap = current.wrap; style.text_options = current.display; }
         if let Some(padding) = resolved.padding { style.padding_edges = Some(padding); }
         if let Some((width, height)) = intrinsic_size {
@@ -446,14 +468,14 @@ pub(crate) fn mount_style_with_intrinsic(
                 if let Some(value) = resolved.radius { quad.radius = value; }
                 if let Some(value) = resolved.border_color { quad.border_color = value; }
                 if let Some(value) = resolved.border_width { quad.border_width = value; }
-                if let Some(value) = resolved.shadow { quad.shadow = value; }
-                if quad.decoration.is_some() || resolved.paint_background.is_some() || resolved.corners.is_some() || resolved.border_edges.is_some() || resolved.border_style.is_some() || resolved.shadows.is_some() {
+                if let Some(value) = resolved.rare().shadow { quad.shadow = value; }
+                if quad.decoration.is_some() || resolved.paint_background.is_some() || resolved.corners.is_some() || resolved.border_edges.is_some() || resolved.rare().border_style.is_some() || resolved.rare().shadows.is_some() {
                     let mut detail = quad.decoration.as_deref().cloned().unwrap_or_default();
                     if let Some(value) = &resolved.paint_background { detail.background = value.clone(); }
                     if let Some(value) = resolved.corners { detail.corners = value; }
                     if let Some(value) = resolved.border_edges { detail.border_widths = value; }
-                    if let Some(value) = resolved.border_style { detail.border_style = value; }
-                    if let Some(value) = &resolved.shadows { detail.shadows = value.clone(); }
+                    if let Some(value) = resolved.rare().border_style { detail.border_style = value; }
+                    if let Some(value) = &resolved.rare().shadows { detail.shadows = value.clone(); }
                     quad.decoration = (detail != crate::decoration::Decoration::default()).then(|| std::sync::Arc::new(detail));
                 }
                 if quad == QuadStyle::default() { NodeKind::Container(if layout_target.is_some() { *layout } else { resolved.layout.unwrap_or(*layout) }) }
@@ -518,13 +540,13 @@ mod tests {
             inherited,
             None,
             Variants {
-                hover: Some(color(2)),
-                active: Some(color(3)),
-                focus: Some(Styles {
+                hover: Some(Box::new(color(2))),
+                active: Some(Box::new(color(3))),
+                focus: Some(Box::new(Styles {
                     border_width: Some(2.),
                     ..Default::default()
-                }),
-                disabled: Some(color(4)),
+                })),
+                disabled: Some(Box::new(color(4))),
             },
             Some(Box::new(move || read_disabled.get())),
             true,

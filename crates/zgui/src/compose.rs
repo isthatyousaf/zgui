@@ -425,19 +425,19 @@ impl View {
         self
     }
     pub fn hover(mut self, style: impl FnOnce(Styles) -> Styles) -> Self {
-        self.variants.hover = Some(style(Styles::new()));
+        self.variants.hover = Some(Box::new(style(Styles::new())));
         self
     }
     pub fn active(mut self, style: impl FnOnce(Styles) -> Styles) -> Self {
-        self.variants.active = Some(style(Styles::new()));
+        self.variants.active = Some(Box::new(style(Styles::new())));
         self
     }
     pub fn focus(mut self, style: impl FnOnce(Styles) -> Styles) -> Self {
-        self.variants.focus = Some(style(Styles::new()));
+        self.variants.focus = Some(Box::new(style(Styles::new())));
         self
     }
     pub fn disabled_style(mut self, style: impl FnOnce(Styles) -> Styles) -> Self {
-        self.variants.disabled = Some(style(Styles::new()));
+        self.variants.disabled = Some(Box::new(style(Styles::new())));
         self
     }
     pub fn disabled(mut self, disabled: bool) -> Self {
@@ -487,9 +487,12 @@ impl View {
         }
         inner.styles.merge(&self.styles);
         inner.children.extend(self.children);
-        fn merge_variant(base: &mut Option<Styles>, patch: Option<Styles>) {
+        fn merge_variant(base: &mut Option<Box<Styles>>, patch: Option<Box<Styles>>) {
             if let Some(patch) = patch {
-                base.get_or_insert_with(Styles::new).merge(&patch);
+                match base {
+                    Some(base) => base.merge(&patch),
+                    None => *base = Some(patch),
+                }
             }
         }
         merge_variant(&mut inner.variants.hover, self.variants.hover);
@@ -1338,8 +1341,8 @@ fn mount_portal(
     }
     defaults.merge(&view.styles);
     view.styles = defaults;
-    let has_max_width = view.styles.max_width.is_some();
-    let has_max_height = view.styles.max_height.is_some();
+    let has_max_width = view.styles.rare().max_width.is_some();
+    let has_max_height = view.styles.rare().max_height.is_some();
     let viewport = ui.observe_bounds(ui.root());
     let mut dynamic = view.reactive_style.take();
     view.reactive_style = Some(Box::new(move || {
@@ -1348,11 +1351,11 @@ fn mount_portal(
             .map_or_else(Styles::new, |compute| compute());
         let bounds = viewport.get();
         let margin = if anchored { 8. } else { 32. };
-        if !has_max_width && styles.max_width.is_none() {
-            styles.max_width = Some((bounds.width - margin).max(0.));
+        if !has_max_width && styles.rare().max_width.is_none() {
+            styles.rare_mut().max_width = Some((bounds.width - margin).max(0.));
         }
-        if !has_max_height && styles.max_height.is_none() {
-            styles.max_height = Some((bounds.height - margin).max(0.));
+        if !has_max_height && styles.rare().max_height.is_none() {
+            styles.rare_mut().max_height = Some((bounds.height - margin).max(0.));
         }
         styles
     }));
@@ -1486,7 +1489,7 @@ fn mount_element(
             || view.styles.background.is_some()
             || view.styles.radius.is_some()
             || view.styles.border_width.is_some()
-            || view.styles.shadow.is_some()
+            || view.styles.rare().shadow.is_some()
             || view.reactive_style.is_some()
             || view.variants.hover.is_some()
             || view.variants.active.is_some()
@@ -1638,15 +1641,15 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.hover.is_none() {
-                view.variants.hover = Some(Styles::new().bg(ui.theme.hover));
+                view.variants.hover = Some(Box::new(Styles::new().bg(ui.theme.hover)));
             }
             if view.variants.focus.is_none() {
-                view.variants.focus = Some(
+                view.variants.focus = Some(Box::new(
                     Styles::new()
                         .bg(ui.theme.hover)
                         .border(1.)
                         .border_color(ui.theme.accent),
-                );
+                ));
             }
             let root = ui.container(parent, Layout::Row, Default::default());
             let mut semantic = SemanticNode::new(Role::MenuItem, label.clone());
@@ -1670,10 +1673,10 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.hover.is_none() {
-                view.variants.hover = Some(Styles::new().bg(ui.theme.hover));
+                view.variants.hover = Some(Box::new(Styles::new().bg(ui.theme.hover)));
             }
             if view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
+                view.variants.focus = Some(Box::new(Styles::new().border(1.).border_color(ui.theme.accent)));
             }
             ui.container(parent, Layout::Row, Default::default())
         }
@@ -1686,10 +1689,10 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.hover.is_none() {
-                view.variants.hover = Some(Styles::new().bg(ui.theme.hover));
+                view.variants.hover = Some(Box::new(Styles::new().bg(ui.theme.hover)));
             }
             if view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
+                view.variants.focus = Some(Box::new(Styles::new().border(1.).border_color(ui.theme.accent)));
             }
             let root = ui.container(parent, Layout::Row, Default::default());
             let mut semantics = SemanticNode::new(Role::CheckBox, label.clone());
@@ -1742,7 +1745,7 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
+                view.variants.focus = Some(Box::new(Styles::new().border(1.).border_color(ui.theme.accent)));
             }
             let root = ui.container(parent, Layout::Overlay, Default::default());
             let mut semantic = SemanticNode::new(Role::Slider, label);
@@ -1761,7 +1764,7 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
+                view.variants.focus = Some(Box::new(Styles::new().border(1.).border_color(ui.theme.accent)));
             }
             let handle = ui.text_input_styled(parent, label, value, multiline);
             let root = handle.node;
@@ -1792,7 +1795,7 @@ fn mount_element(
             defaults.merge(&view.styles);
             view.styles = defaults;
             if keyboard_navigation && view.variants.focus.is_none() {
-                view.variants.focus = Some(Styles::new().border(1.).border_color(ui.theme.accent));
+                view.variants.focus = Some(Box::new(Styles::new().border(1.).border_color(ui.theme.accent)));
             }
             region = Some(Box::new(move |ui: &mut Ui, root, environment| {
                 build(ui, root, environment, scrollbar, keyboard_navigation)
@@ -1911,10 +1914,13 @@ fn mount_element(
                     });
                 }
                 let mut font = base.font.clone();
-                if let Some(value) = span.styles.font_fallbacks {
+                let rare = span.styles.rare();
+                let (fallbacks, features, spacing) =
+                    (rare.font_fallbacks.clone(), rare.font_features.clone(), rare.letter_spacing);
+                if let Some(value) = fallbacks {
                     font.fallbacks = value;
                 }
-                if let Some(value) = span.styles.font_features {
+                if let Some(value) = features {
                     font.features = value;
                 }
                 if let Some(value) = span.styles.font_family {
@@ -1929,7 +1935,7 @@ fn mount_element(
                 if let Some(value) = span.styles.line_height {
                     font.line_height = value;
                 }
-                if let Some(value) = span.styles.letter_spacing {
+                if let Some(value) = spacing {
                     font.letter_spacing = value;
                 }
                 runs.push(crate::rich_text::TextRun {

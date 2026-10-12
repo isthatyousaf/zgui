@@ -609,6 +609,169 @@ impl Default for Application {
 /// A window that has presented nothing for this long releases animation-only
 /// renderer memory.
 const TRIM_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Frames presented this close together are a steady run.
+#[cfg(target_os = "macos")]
+const STEADY_GAP: std::time::Duration = std::time::Duration::from_millis(50);
+/// Sleep until `at`: a long sleep ends up to a millisecond or two late (the
+/// kernel coalesces timers in proportion to their length), so the last
+/// stretch is a short one of its own.
+#[cfg(target_os = "macos")]
+fn sleep_until(at: std::time::Instant) {
+    const SHORT: std::time::Duration = std::time::Duration::from_micros(1500);
+    let now = std::time::Instant::now();
+    if at > now + SHORT {
+        std::thread::sleep(at - now - SHORT);
+    }
+    let now = std::time::Instant::now();
+    if at > now {
+        std::thread::sleep(at - now);
+    }
+}
+/// The refresh point steady frames present at (see `Host::refresh_grid`),
+/// and when they render before it.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct Latch {
+    /// When the last steady frame was ready, and when it presented.
+    last: Option<(std::time::Instant, std::time::Instant)>,
+    /// Frames in a row ready comfortably before their point while keeping
+    /// a later cadence.
+    early: u8,
+    /// How long after it could start a frame starts rendering (`hold`).
+    offset: std::time::Duration,
+    /// The most a frame could wait before rendering and still be ready by
+    /// its point, as last held.
+    room: std::time::Duration,
+    /// When the frame being drawn started rendering, and how long frames
+    /// lately took from there until ready (the most, forgotten over seconds).
+    started: Option<std::time::Instant>,
+    work: std::time::Duration,
+    /// The GPU time of an unhindered frame: the least seen lately.
+    clean: Option<std::time::Duration>,
+    /// Frames since one the GPU held up.
+    since_held: u8,
+    /// The point the frame rendering after a delay was held for, and frames
+    /// left before holding again after one missed it.
+    planned: Option<std::time::Instant>,
+    resting: u8,
+    /// How long the frame rendering was held (`hold`).
+    held: std::time::Duration,
+}
+#[cfg(target_os = "macos")]
+impl Latch {
+    /// How long before a refresh shows a frame presents. At 2.3 ms a
+    /// dashboard repainting most of its window still missed refreshes (2% of
+    /// intervals late, p99 28 ms); at 2 ms none (p99 21 ms), lighter windows
+    /// alike or better. Closer than 2 ms gained nothing.
+    const LEAD: std::time::Duration = std::time::Duration::from_micros(2000);
+    /// How early before its point a frame must be ready, `RETURN` frames in a
+    /// row, before a later cadence gives way to the coming point: a stream
+    /// ready near a point, some frames just before and some just after, all
+    /// wait for the next.
+    const KEEP: std::time::Duration = std::time::Duration::from_micros(1500);
+    const RETURN: u8 = 8;
+    /// How far frames the GPU held up move their successors (`ran`).
+    const STEP: std::time::Duration = std::time::Duration::from_millis(2);
+    /// Frames rendered at once after a held one missed its refresh.
+    const REST: u8 = 120;
+    /// When a frame complete at `now` presents, on the refresh grid through
+    /// `origin` with `period`.
+    fn decide(&mut self, now: std::time::Instant, origin: std::time::Instant, period: std::time::Duration) -> std::time::Instant {
+        if let Some(started) = self.started.take() {
+            self.work = now.saturating_duration_since(started).max(self.work.mul_f64(0.99));
+        }
+        // Decided as if rendered when it could have been: held frames would
+        // otherwise come ready milliseconds apart from one to the next, and
+        // count whole refreshes between them wrongly. Past that point by
+        // now (slower than any frame lately), the next on the grid.
+        let ready = now.checked_sub(std::mem::take(&mut self.held)).unwrap_or(now);
+        let (mut at, early) = self.choose(ready, origin, period);
+        while at < now {
+            at += period;
+        }
+        self.early = early;
+        // Held into a later refresh than planned: hold none for a while.
+        if self.planned.take().is_some_and(|planned| at > planned + period / 2) {
+            self.offset = std::time::Duration::ZERO;
+            self.resting = Self::REST;
+        }
+        self.last = Some((ready, at));
+        at
+    }
+    /// The point a frame ready at `ready` presents at, and the count of
+    /// frames comfortably early on a later cadence that it leaves.
+    fn choose(&self, ready: std::time::Instant, origin: std::time::Instant, period: std::time::Duration) -> (std::time::Instant, u8) {
+        // The phase of `ready` on the grid, either side of `origin`.
+        let period_ns = period.as_nanos().max(1);
+        let since = match ready.checked_duration_since(origin) {
+            Some(after) => after.as_nanos() % period_ns,
+            None => (period_ns - origin.duration_since(ready).as_nanos() % period_ns) % period_ns,
+        };
+        let phase = std::time::Duration::from_nanos(since as u64);
+        let point = ready - phase + period.saturating_sub(Self::LEAD);
+        let first = if point >= ready { point } else { point + period };
+        // A later cadence (the last frame's, whole refreshes after it) holds
+        // until frames come comfortably early, several in a row.
+        let late = self.last.is_some_and(|(last, at)| {
+            let refreshes = (ready.saturating_duration_since(last).as_secs_f64() / period.as_secs_f64()).round();
+            let cadence = at + period.mul_f64(refreshes);
+            cadence > first + period / 2 && cadence < first + period * 3 / 2
+        });
+        let early = if late && first - ready >= Self::KEEP { self.early + 1 } else { 0 };
+        if late && early < Self::RETURN {
+            (first + period, early)
+        } else {
+            (first, 0)
+        }
+    }
+    /// When a frame that could start rendering at `now` does. It waits for
+    /// its point once rendered anyway; rendering later within the wait, still
+    /// `KEEP` ahead of the point it would have had (going by the longest any
+    /// frame took lately), shows it on the same refresh. The point is still
+    /// chosen once the frame is ready (`decide`); a held frame that misses it
+    /// (work beyond any lately) stops holding for a couple of seconds.
+    ///
+    /// The window server composites other windows' changes on the GPU at
+    /// their own times, a millisecond or more of work on a 5K display, and a
+    /// frame rendering through it takes several times as long: beside a 30
+    /// Hz animation, every other frame of a 60 Hz stream ran 1–1.4 ms instead
+    /// of 0.3. Frames the GPU holds up (`ran`) move the time their successors
+    /// render within the wait until they are not: a dashboard's stream in
+    /// Metal System Trace went from a median 39 to 21 ms of GPU per second.
+    fn hold(&mut self, now: std::time::Instant, origin: std::time::Instant, period: std::time::Duration) -> std::time::Instant {
+        let ready = now + self.work;
+        let (point, _) = self.choose(ready, origin, period);
+        self.room = point.saturating_duration_since(ready).saturating_sub(Self::KEEP);
+        if self.offset > self.room || self.resting > 0 {
+            self.offset = std::time::Duration::ZERO;
+        }
+        self.resting = self.resting.saturating_sub(1);
+        self.planned = (!self.offset.is_zero()).then_some(point);
+        self.held = self.offset;
+        now + self.offset
+    }
+    /// The frame that started rendering at `at` (after `hold`).
+    fn rendering(&mut self, at: std::time::Instant) {
+        self.started = Some(at);
+    }
+    /// How long the GPU took to run the frame just presented: well over the
+    /// least lately, twice within a few frames, is another client's rhythm.
+    fn ran(&mut self, gpu: std::time::Duration) {
+        let clean = self.clean.map_or(gpu, |clean| gpu.min(clean.mul_f64(1.02)));
+        self.clean = Some(clean);
+        if gpu <= clean.mul_f64(1.5) + std::time::Duration::from_micros(50) {
+            self.since_held = self.since_held.saturating_add(1);
+            return;
+        }
+        if self.since_held < 4 && self.resting == 0 {
+            self.offset += Self::STEP;
+            if self.offset > self.room {
+                self.offset = std::time::Duration::ZERO;
+            }
+        }
+        self.since_held = 0;
+    }
+}
 /// After the first presented frame, when to release startup's freed heap.
 const STARTUP_TRIM_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -658,6 +821,15 @@ struct Host {
     /// Frames are wanted and the aligned timer paces them.
     #[cfg(target_os = "macos")]
     vsync_paced: bool,
+    /// The display link paces frames at the display's full rate.
+    #[cfg(target_os = "macos")]
+    link_paced: bool,
+    /// When a frame was last presented, and the cadence steady frames keep
+    /// (see `Host::refresh_grid`).
+    #[cfg(target_os = "macos")]
+    presented_at: Option<std::time::Instant>,
+    #[cfg(target_os = "macos")]
+    latch: Latch,
     frame_timer: crate::frame_source::FrameTimer,
     frame_interval: std::time::Duration,
     /// A display refresh arrived since the last paint. While the display link
@@ -795,6 +967,12 @@ impl Host {
             vsync_synced: None,
             #[cfg(target_os = "macos")]
             vsync_paced: false,
+            #[cfg(target_os = "macos")]
+            link_paced: false,
+            #[cfg(target_os = "macos")]
+            presented_at: None,
+            #[cfg(target_os = "macos")]
+            latch: Latch::default(),
             frame_arrived: false,
             trim_at: None,
             startup_trim: StartupTrim::Pending,
@@ -939,6 +1117,14 @@ impl Host {
                 self.force = true;
                 window.request_redraw();
             } else {
+                // Steady frames render at a time of their own within their
+                // wait for the refresh point (`Latch::hold`).
+                #[cfg(target_os = "macos")]
+                if let Some((origin, period)) = self.refresh_grid() {
+                    let at = self.latch.hold(std::time::Instant::now(), origin, period);
+                    sleep_until(at);
+                    self.latch.rendering(std::time::Instant::now());
+                }
                 if let Some(renderer) = &mut self.renderer {
                     let stats = renderer.render(&scene, damage)?;
                     if let Some(frame) = &mut self.damage_check {
@@ -953,16 +1139,37 @@ impl Host {
                 self.force = false;
             }
         }
-        if self.presentation.ready(std::time::Instant::now())
-            && let Some(renderer) = &mut self.renderer
-        {
+        if self.presentation.ready(std::time::Instant::now()) && self.renderer.is_some() {
             if self.frame_paced && !self.present_ready {
                 // winit withholds RedrawRequested until the compositor grants a
                 // new frame. A covered surface must never block vkQueuePresent
                 // on the shared UI thread. Keep its rendered target and damage.
                 window.request_redraw();
             } else {
-                let status = renderer.present_with_notify(|| window.pre_present_notify())?;
+                // Steady frames show at a set point in a refresh (`refresh_grid`),
+                // waited for once the frame is complete, just before it is
+                // handed over.
+                #[cfg(target_os = "macos")]
+                let grid = self.refresh_grid();
+                #[cfg(target_os = "macos")]
+                let latch = &mut self.latch;
+                let renderer = self.renderer.as_mut().expect("checked above");
+                let status = renderer.present_with_notify(|| {
+                    window.pre_present_notify();
+                    #[cfg(target_os = "macos")]
+                    if let Some((origin, period)) = grid {
+                        sleep_until(latch.decide(std::time::Instant::now(), origin, period));
+                    }
+                })?;
+                #[cfg(target_os = "macos")]
+                {
+                    self.presented_at = Some(std::time::Instant::now());
+                    if let Some(gpu) = renderer.take_gpu_time()
+                        && grid.is_some()
+                    {
+                        self.latch.ran(gpu);
+                    }
+                }
                 if status == zgui_gpu::PresentationStatus::Presented {
                     self.present_ready = false;
                     let now = std::time::Instant::now();
@@ -1738,6 +1945,39 @@ impl Host {
             self.deliver_frame(frame);
         }
     }
+    /// The display's refresh grid (a refresh's start, and the period) for
+    /// handing over a steady frame at a set point before a refresh, where the
+    /// window server reliably shows it on that refresh (`Latch::decide`).
+    ///
+    /// Frames an app's own timer produces (a 60 Hz stream, say) are ready at
+    /// whatever phase that timer has against the display, fixed for as long
+    /// as both run. Handed over at once, those near the window server's
+    /// latch make a refresh or miss it by chance, so showing every other
+    /// refresh becomes one refresh, then three: in captures of a window at
+    /// 120 Hz, 1–5% of intervals, and in some runs 20%. Handed over about
+    /// 2 ms before a refresh shows (`Latch::LEAD`, on the display's exact
+    /// refresh grid: see `DisplayLink::refresh_phase`), none in 99.9%; 2 ms
+    /// or more away from that, runs again miss. Each frame keeps the last one's cadence (whole
+    /// refreshes after it) while that stays ahead, so one ready near a point
+    /// does not alternate between it and the next. Frames the link paces
+    /// start at a refresh and are left alone.
+    #[cfg(target_os = "macos")]
+    fn refresh_grid(&mut self) -> Option<(std::time::Instant, std::time::Duration)> {
+        let now = std::time::Instant::now();
+        let steady = self
+            .presented_at
+            .is_some_and(|at| now.duration_since(at) < STEADY_GAP);
+        let refresh = self
+            .display_link
+            .as_ref()
+            .filter(|_| steady && !self.link_paced)
+            .and_then(|link| link.refresh_phase(now, crate::frame_source::VSYNC_RESYNC * 3));
+        let Some((phase, period)) = refresh else {
+            self.latch = Latch::default();
+            return None;
+        };
+        Some((now - phase, period))
+    }
     /// Start, stop or schedule this window's frame source to match demand.
     fn sync_frames(&mut self) {
         let now = std::time::Instant::now();
@@ -1747,8 +1987,14 @@ impl Host {
             self.frame_heartbeat = None;
             self.frame_deadline = None;
         }
+        // Steady frames of the app's own timing present against the refresh
+        // grid (`refresh_grid`), which the link reports.
         #[cfg(target_os = "macos")]
-        if wanted
+        let steady = self
+            .presented_at
+            .is_some_and(|at| now.duration_since(at) < STEADY_GAP);
+        #[cfg(target_os = "macos")]
+        if (wanted || steady)
             && self.display_link.is_none()
             && let Some(window) = &self.window
         {
@@ -1775,6 +2021,7 @@ impl Host {
             // reported, and the link (a thread spinning to each refresh) runs
             // again only to resync.
             let animating = wanted && rate.is_none() && !scrolling;
+            self.link_paced = animating;
             if let Some(renderer) = &mut self.renderer {
                 renderer.set_full_rate(wanted && rate.is_none());
             }
@@ -1788,7 +2035,12 @@ impl Host {
                 self.frame_deadline = None;
             }
             self.vsync_paced = timed;
-            link.set_running(wanted && !synced);
+            // Steady frames of the app's own timing need the refresh grid
+            // only: the link runs a refresh or so a second to report it.
+            let stale = self
+                .vsync_synced
+                .is_none_or(|at| now.duration_since(at) >= crate::frame_source::VSYNC_RESYNC);
+            link.set_running((wanted && !synced) || (!wanted && steady && stale));
             if wanted {
                 if timed {
                     if self.frame_deadline.is_none() {
@@ -2509,6 +2761,81 @@ fn release_freed_heap() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn steady_frames_present_on_the_point_and_keep_their_cadence() {
+        use std::time::{Duration, Instant};
+        let period = Duration::from_nanos(8_333_333);
+        let ms = |v: f64| Duration::from_secs_f64(v / 1e3);
+        let origin = Instant::now();
+        let phase = |at: Instant| (at.duration_since(origin).as_nanos() % period.as_nanos()) as f64 / 1e6;
+        let point = (period - Latch::LEAD).as_secs_f64() * 1e3;
+        let mut latch = Latch::default();
+        // Ready before the point: it presents on this refresh's point.
+        let ready = origin + period * 10 + ms(2.);
+        let at = latch.decide(ready, origin, period);
+        assert!((phase(at) - point).abs() < 0.01 && at - ready < period);
+        // A 60 Hz stream ready right at the point, some frames just after it
+        // and some just before, keeps one cadence: every frame two refreshes
+        // after the last, all on the next refresh's point.
+        let mut last = at;
+        for (i, offset) in [0.1, -0.1, 0.2, -0.2, 0.05, -0.3].into_iter().enumerate() {
+            let ready = origin + period * (12 + 2 * i as u32) + ms(point + offset);
+            let at = latch.decide(ready, origin, period);
+            assert!((phase(at) - point).abs() < 0.01);
+            if i > 0 {
+                assert_eq!((at.duration_since(last).as_secs_f64() / period.as_secs_f64()).round(), 2.);
+            }
+            last = at;
+        }
+        // Comfortably early again, frame after frame: back to the coming point.
+        let mut at = latch.decide(origin + period * 30 + ms(point - 3.), origin, period);
+        for i in 0..Latch::RETURN as u32 {
+            let ready = origin + period * (32 + 2 * i) + ms(point - 3.);
+            at = latch.decide(ready, origin, period);
+            assert!(at - ready < ms(3.1) || i + 1 < Latch::RETURN as u32);
+        }
+        assert!((phase(at) - point).abs() < 0.01);
+        // Never more than a refresh's wait, never in the past.
+        let ready = origin + period * 40 + ms(7.);
+        let at = latch.decide(ready, origin, period);
+        assert!(at >= ready && at - ready < period);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn held_up_frames_render_later_within_their_wait() {
+        use std::time::{Duration, Instant};
+        let period = Duration::from_nanos(8_333_333);
+        let ms = |v: f64| Duration::from_secs_f64(v / 1e3);
+        let origin = Instant::now();
+        let point = (period - Latch::LEAD).as_secs_f64() * 1e3;
+        let phase = |at: Instant| (at.duration_since(origin).as_nanos() % period.as_nanos()) as f64 / 1e6;
+        let mut latch = Latch::default();
+        // A 60 Hz stream that can render 1 ms into a refresh, ready 0.5 ms
+        // later: about 3 ms to spare before its point, less `KEEP`.
+        let mut frame = |i: u32, gpu: f64| {
+            let could = origin + period * (10 + 2 * i) + ms(1.);
+            let start = latch.hold(could, origin, period);
+            latch.rendering(start);
+            let at = latch.decide(start + ms(0.5), origin, period);
+            latch.ran(ms(gpu));
+            assert!((phase(at) - point).abs() < 0.01);
+            assert!(at - could < period);
+            start - could
+        };
+        for i in 0..4 {
+            assert_eq!(frame(i, 0.3), Duration::ZERO);
+        }
+        // Held up once: chance. Twice within a few frames: the next renders
+        // a step later, still on the same point.
+        frame(4, 1.2);
+        assert_eq!(frame(5, 1.2), Duration::ZERO);
+        assert_eq!(frame(6, 0.3), Latch::STEP);
+        assert_eq!(frame(7, 0.3), Latch::STEP);
+        // Held up there too: no room for another step, back to the start.
+        assert_eq!(frame(8, 1.2), Latch::STEP);
+        assert_eq!(frame(9, 0.3), Duration::ZERO);
+    }
     #[test]
     fn window_commands_preserve_recreation_options() {
         let mut options = WindowOptions::default();

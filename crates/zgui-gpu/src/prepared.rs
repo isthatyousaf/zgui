@@ -36,8 +36,11 @@ use zgui::{rich_text::RichText, text_layout::FontStyle};
 /// go, down to three quarters of it at once so eviction runs rarely.
 const SHAPED_BUDGET: usize = 32 * 1024 * 1024;
 const COMPACT_BUDGET: usize = 16 * 1024 * 1024;
-/// Shaped text a renderer does not draw is kept to this (see `trim`).
-const UNDRAWN_BUDGET: usize = 512 * 1024;
+/// Shaped text a renderer does not draw is kept to this (see `trim`): a few
+/// rows scrolled away or a value switched back. A dashboard whose live values
+/// all change every frame held about 1.3 MB more heap at 512 KB, for no
+/// measurable CPU difference.
+const UNDRAWN_BUDGET: usize = 64 * 1024;
 /// Estimated bytes per character of shaped lines: a shape glyph and a layout
 /// glyph (96 + 88 bytes), and words and line text.
 const SHAPED_BYTES_PER_CHAR: usize = 190;

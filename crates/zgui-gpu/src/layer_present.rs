@@ -1,6 +1,6 @@
-//! macOS presentation through IOSurfaces of the renderer's own, queued for
-//! display by an `AVSampleBufferDisplayLayer` instead of `CAMetalLayer`
-//! drawables.
+//! macOS presentation through IOSurfaces of the renderer's own, shown by a
+//! plain layer or, at the display's full rate, queued by an
+//! `AVSampleBufferDisplayLayer`, instead of `CAMetalLayer` drawables.
 //!
 //! A drawable's contents are not kept between frames, so presenting one means
 //! filling all of it: copying the whole retained frame every frame. A surface
@@ -10,14 +10,17 @@
 //!
 //! Shown as a plain layer's contents, a surface replaces the one before; the
 //! window server, compositing on a schedule of its own, then now and then
-//! takes two in one refresh and shows nothing new in the next (measured: one
-//! frame in fifty at the display's rate, 99th-percentile frame interval
-//! about 21 ms where 13 is possible). A sample buffer display layer queues
-//! what it is given, one image a refresh, as `CAMetalLayer` does with its
-//! drawables, but without a drawable's per-frame bookkeeping: each surface is
-//! wrapped once in a sample buffer that is enqueued again whenever the
-//! surface holds the next frame. Frames that come one at a time, and the last
-//! frame of a window at rest, are a plain layer's contents (see `Layer`).
+//! takes two in one refresh and shows nothing new in the next when frames
+//! come at the display's full rate (measured: one frame in fifty, the
+//! 99th-percentile frame interval about 21 ms where 13 is possible). A
+//! sample buffer display layer queues what it is given, one image a refresh,
+//! as `CAMetalLayer` does with its drawables, but without a drawable's
+//! per-frame bookkeeping: each surface is wrapped once in a sample buffer
+//! that is enqueued again whenever the surface holds the next frame. Slower
+//! frames (an app's own 60 Hz updates, typing) are the plain layer's
+//! contents: handed over at a set point before a refresh (the host's
+//! `refresh_grid`), they show on it reliably, which the video layer's own thread
+//! does not quite manage, and cost less (see `Layer`).
 use crate::{FORMAT, GpuError};
 use objc2::{Encoding, Message, RefEncode, msg_send, rc::Retained, runtime::AnyObject};
 use objc2_core_foundation::{
@@ -307,12 +310,11 @@ impl Drop for Sample {
 /// Layers showing the presented surface, filling the window's `CAMetalLayer`
 /// (which follows the view's size and, given no drawables, shows nothing).
 ///
-/// While frames come steadily, a sample buffer display layer queues them
-/// (see the module's documentation). Once it exists its CoreMedia thread
-/// wakes about 55 times a second for good, even with nothing to show, so a
-/// window at rest shows its last frame as a plain layer's contents instead
-/// and drops it; frames that come one at a time (typing, hovering) replace
-/// the plain layer's contents, which shows them at its next composite.
+/// While frames come at the display's full rate, a sample buffer display
+/// layer queues them (see the module's documentation). Once it exists its
+/// CoreMedia thread wakes about 55 times a second for good, even with
+/// nothing to show, so slower frames, and a window at rest, are a plain
+/// layer's contents instead, and the video layer is dropped at rest.
 pub(crate) struct Layer {
     host: Retained<CAMetalLayer>,
     plain: Retained<CALayer>,
@@ -546,7 +548,8 @@ impl Layer {
         self.video.as_ref().and_then(Video::displayed)
     }
     /// Show `buffer`'s surface: queued by the video layer when `steady`
-    /// (frames keep coming), else as the plain layer's contents. `opaque`:
+    /// (frames come at the display's full rate), else as the plain layer's
+    /// contents. `opaque`:
     /// every pixel is, so the window server need not blend the layers over
     /// what lies behind them.
     pub fn show(&mut self, buffer: &Buffer, opaque: bool, steady: bool) {

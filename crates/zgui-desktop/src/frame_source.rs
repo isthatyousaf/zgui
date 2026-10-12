@@ -185,6 +185,10 @@ mod display_link {
         link: usize,
         running: bool,
         subscribers: Vec<Arc<Subscriber>>,
+        /// The refresh the link last reported starting (host time), and the
+        /// display's refresh period (ns): its refresh grid.
+        refreshed: AtomicU64,
+        period: AtomicU64,
     }
     #[derive(Default)]
     struct Registry {
@@ -226,6 +230,10 @@ mod display_link {
         let Some(entry) = guard.as_ref().and_then(|r| r.displays.get(&display)) else {
             return 0;
         };
+        // The output time: exactly on the display's refresh grid (the
+        // callback's `now`, when it runs, wanders by up to 2 ms).
+        entry.refreshed.store(output.host_time, Ordering::Release);
+        entry.period.store(interval.as_nanos() as u64, Ordering::Release);
         for subscriber in &entry.subscribers {
             if !subscriber.active.load(Ordering::Acquire) {
                 continue;
@@ -297,6 +305,8 @@ mod display_link {
             link: link as usize,
             running: false,
             subscribers: Vec::new(),
+            refreshed: AtomicU64::new(0),
+            period: AtomicU64::new(0),
         });
         true
     }
@@ -366,6 +376,31 @@ mod display_link {
                 self.subscriber.pending.store(false, Ordering::Release);
                 reconcile(self.display);
             }
+        }
+        /// How far into a refresh of the window's display `at` falls, and the
+        /// refresh period, on the display's refresh grid as the link last
+        /// reported it (within `fresh`): refreshes start when the previous
+        /// one shows.
+        pub(crate) fn refresh_phase(&self, at: Instant, fresh: Duration) -> Option<(Duration, Duration)> {
+            let (refreshed, period) = {
+                let guard = registry();
+                let entry = guard.as_ref()?.displays.get(&self.display)?;
+                (entry.refreshed.load(Ordering::Acquire), entry.period.load(Ordering::Acquire))
+            };
+            if refreshed == 0 || period == 0 {
+                return None;
+            }
+            // SAFETY: reads the monotonic host clock.
+            let host_now = unsafe { mach_absolute_time() };
+            // The output time is a refresh or two ahead; the grid continues
+            // back from it.
+            let since = nanos(host_now as i128 - refreshed as i128)
+                + at.saturating_duration_since(Instant::now()).as_nanos() as i128;
+            if since > fresh.as_nanos() as i128 {
+                return None;
+            }
+            let phase = since.rem_euclid(period as i128) as u64;
+            Some((Duration::from_nanos(phase), Duration::from_nanos(period)))
         }
         /// The UI thread took the last delivered refresh; deliver the next.
         pub(crate) fn consumed(&self) {

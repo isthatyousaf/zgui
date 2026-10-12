@@ -713,11 +713,8 @@ struct LayerPresent {
     /// frame draws (`begin_layer_frame`).
     catch_up: Vec<Scissor>,
     /// Frames come at the display's full rate (`GpuRenderer::set_full_rate`):
-    /// a third surface is kept for them.
+    /// a third surface is kept for them, and the layer queues them.
     full_rate: bool,
-    /// When the last frame was shown: one soon after it is part of a steady
-    /// run of frames, queued by the layer (`Layer::show`).
-    shown_at: Option<std::time::Instant>,
 }
 #[cfg(target_os = "macos")]
 impl LayerPresent {
@@ -1052,6 +1049,9 @@ pub struct GpuRenderer {
     /// A directly encoded frame, committed, until it is known complete.
     #[cfg(target_os = "macos")]
     metal_inflight: RefCell<Option<metal_frame::CommandBuffer>>,
+    /// How long the GPU took to run the last direct frame (`take_gpu_time`).
+    #[cfg(target_os = "macos")]
+    gpu_time: std::cell::Cell<Option<std::time::Duration>>,
     /// The viewport uniform `select_viewport` chose last, for direct frames.
     #[cfg(target_os = "macos")]
     viewport_values: [f32; 4],
@@ -1283,6 +1283,8 @@ impl GpuRenderer {
             metal_frame: Default::default(),
             #[cfg(target_os = "macos")]
             metal_inflight: RefCell::new(None),
+            #[cfg(target_os = "macos")]
+            gpu_time: std::cell::Cell::new(None),
             #[cfg(target_os = "macos")]
             viewport_values: [0.; 4],
             #[cfg(target_os = "macos")]
@@ -3036,6 +3038,9 @@ impl GpuRenderer {
             return false;
         };
         buffer.waitUntilCompleted();
+        let ran = buffer.GPUEndTime() - buffer.GPUStartTime();
+        self.gpu_time
+            .set((ran > 0.).then(|| std::time::Duration::from_secs_f64(ran)));
         if let Some(mapped) = &self.mapped {
             mapped.borrow_mut().completed();
         }
@@ -4190,14 +4195,8 @@ impl GpuRenderer {
             });
         }
         before_present();
-        let now = std::time::Instant::now();
-        let steady = present.full_rate
-            || present
-                .shown_at
-                .is_some_and(|at| now - at < std::time::Duration::from_millis(50));
-        present.shown_at = Some(now);
         let layer = present.layer.as_mut().expect("attached above");
-        layer.show(&present.buffers[index].0, self.background.3 == 255, steady);
+        layer.show(&present.buffers[index].0, self.background.3 == 255, present.full_rate);
         present.frame += 1;
         let frame = present.frame;
         present.buffers[index].1 = Some(frame);
@@ -4210,11 +4209,19 @@ impl GpuRenderer {
         self.layer_present = Some(present);
         Ok(PresentationStatus::Presented)
     }
+    /// How long the GPU took to run the frame last presented, when it was
+    /// encoded with Metal directly: the frame's own work, plus however long
+    /// other work on the GPU (the window server's compositing, other apps)
+    /// held it up. Taken: `None` until another such frame presents.
+    #[cfg(target_os = "macos")]
+    pub fn take_gpu_time(&mut self) -> Option<std::time::Duration> {
+        self.gpu_time.take()
+    }
     /// Whether frames come at the display's full rate (animating or
-    /// scrolling). On macOS a display layer still holds the surface shown
-    /// before the shown one when the next frame starts, so full-rate frames
-    /// keep a third surface; slower ones reuse that surface once the layer
-    /// shows the next. Elsewhere ignored.
+    /// scrolling). On macOS those are queued by a video layer, which still
+    /// holds the surface shown before the shown one when the next frame
+    /// starts, so they keep a third surface; slower frames are a plain
+    /// layer's contents, each replacing the last. Elsewhere ignored.
     pub fn set_full_rate(&mut self, #[allow(unused)] full: bool) {
         #[cfg(target_os = "macos")]
         if let Some(present) = &mut self.layer_present {
@@ -4987,7 +4994,8 @@ pub(crate) const QUAD_STRIP: wgpu::PrimitiveState = wgpu::PrimitiveState {
 /// Regions a frame draws at most: each draws every batch it touches again.
 const MAX_REGIONS: usize = 16;
 /// Damage in at most `MAX_REGIONS` groups, each the bounds of its members:
-/// rectangles sharing a cell of a grid whose cells double until few enough.
+/// rectangles sharing a cell of a grid, the finest of cells doubling from 16
+/// that leaves few enough.
 fn cluster_damage(damage: &[Rect], viewport: Rect) -> Vec<Rect> {
     fn root(parent: &mut [usize], mut i: usize) -> usize {
         while parent[i] != i {
@@ -4996,8 +5004,7 @@ fn cluster_damage(damage: &[Rect], viewport: Rect) -> Vec<Rect> {
         }
         i
     }
-    let mut cell = 16_f32;
-    loop {
+    let groups = |cell: f32| -> Vec<Rect> {
         let columns = (viewport.width / cell).ceil().max(1.) as usize;
         let rows = (viewport.height / cell).ceil().max(1.) as usize;
         let mut owner = vec![usize::MAX; columns * rows];
@@ -5024,12 +5031,40 @@ fn cluster_damage(damage: &[Rect], viewport: Rect) -> Vec<Rect> {
             let group = &mut bounds[root(&mut parent, i)];
             *group = Some(group.map_or(*r, |g| g.union(*r)));
         }
-        let groups: Vec<Rect> = bounds.into_iter().flatten().collect();
-        if groups.len() <= MAX_REGIONS || cell >= viewport.width.max(viewport.height) {
-            return groups;
-        }
-        cell *= 2.;
+        bounds.into_iter().flatten().collect()
+    };
+    let fits = |groups: &Vec<Rect>, cell: f32| {
+        groups.len() <= MAX_REGIONS || cell >= viewport.width.max(viewport.height)
+    };
+    // Coarser cells only merge groups, so the answer is the finest cell that
+    // fits. A frame's damage is much like the last one's: search from the
+    // cell that fitted last time instead of from 16 (a dashboard changing
+    // everywhere doubled five or six times every frame).
+    thread_local! {
+        static LAST: std::cell::Cell<f32> = const { std::cell::Cell::new(16.) };
     }
+    let mut cell = LAST.get().max(16.);
+    let mut found = groups(cell);
+    if fits(&found, cell) {
+        while cell > 16. {
+            let finer = groups(cell / 2.);
+            if !fits(&finer, cell / 2.) {
+                break;
+            }
+            cell /= 2.;
+            found = finer;
+        }
+    } else {
+        loop {
+            cell *= 2.;
+            found = groups(cell);
+            if fits(&found, cell) {
+                break;
+            }
+        }
+    }
+    LAST.set(cell);
+    found
 }
 fn merge_damage(damage: &[Rect], viewport: Rect, scale: f32) -> Vec<Rect> {
     // Each region redraws every batch it touches: nearby small ones (the

@@ -32,15 +32,10 @@ pub struct Styles {
     pub(crate) height: Option<f32>,
     pub(crate) width_percent: Option<f32>,
     pub(crate) height_percent: Option<f32>,
-    pub(crate) min_width: Option<f32>,
-    pub(crate) max_width: Option<f32>,
-    pub(crate) min_height: Option<f32>,
-    pub(crate) max_height: Option<f32>,
     pub(crate) padding: Option<Insets>,
     pub(crate) margin: Option<Insets>,
     pub(crate) gap: Option<f32>,
     pub(crate) clip: Option<bool>,
-    pub(crate) fade_edges: Option<[f32; 2]>,
     pub(crate) flex_grow: Option<f32>,
     pub(crate) flex_shrink: Option<f32>,
     pub(crate) align: Option<Align>,
@@ -48,27 +43,16 @@ pub struct Styles {
     pub(crate) text_wrap: Option<bool>,
     pub(crate) background: Option<Color>,
     pub(crate) cursor: Option<crate::cursor::Cursor>,
-    pub(crate) paint_background: Option<Option<crate::decoration::Background>>,
-    pub(crate) corners: Option<Option<crate::decoration::Corners>>,
-    pub(crate) border_edges: Option<Option<Insets>>,
-    pub(crate) border_style: Option<crate::decoration::BorderStyle>,
-    pub(crate) shadows: Option<Option<std::sync::Arc<[BoxShadow]>>>,
     pub(crate) text_color: Option<Color>,
     pub(crate) text_size: Option<f32>,
     pub(crate) line_height: Option<crate::text_layout::LineHeight>,
-    pub(crate) letter_spacing: Option<crate::text_layout::LetterSpacing>,
     pub(crate) font_family: Option<crate::text_layout::FontFamily>,
-    pub(crate) text_overflow: Option<crate::text_layout::TextOverflow>,
-    pub(crate) line_clamp: Option<Option<std::num::NonZeroU32>>,
     pub(crate) text_align: Option<crate::text_layout::TextAlign>,
-    pub(crate) font_features: Option<crate::text_layout::FontFeatures>,
-    pub(crate) font_fallbacks: Option<std::sync::Arc<[crate::text_layout::FontFamily]>>,
     pub(crate) font_weight: Option<u16>,
     pub(crate) italic: Option<bool>,
     pub(crate) radius: Option<f32>,
     pub(crate) border_width: Option<f32>,
     pub(crate) border_color: Option<Color>,
-    pub(crate) shadow: Option<Option<BoxShadow>>,
     pub(crate) opacity: Option<f32>,
     pub(crate) blur: Option<f32>,
     pub(crate) edge_fade: Option<f32>,
@@ -76,8 +60,115 @@ pub struct Styles {
     pub(crate) isolated: Option<bool>,
     pub(crate) padding_sides: u8,
     pub(crate) margin_sides: u8,
+    /// Set (to none) by `bg`, `rounded` and `border`, so on most nodes.
+    pub(crate) paint_background: Option<Option<crate::decoration::Background>>,
+    pub(crate) corners: Option<Option<crate::decoration::Corners>>,
+    pub(crate) border_edges: Option<Option<Insets>>,
+    /// Properties few views set (see `RareStyles`).
+    pub(crate) rare: Option<std::sync::Arc<RareStyles>>,
 }
+/// Properties few views set, kept apart and shared so that every `Styles`
+/// (a view's, its node's style effect's and that effect's memo) stays small:
+/// a `Styles` is copied and compared on every re-run.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct RareStyles {
+    pub(crate) min_width: Option<f32>,
+    pub(crate) max_width: Option<f32>,
+    pub(crate) min_height: Option<f32>,
+    pub(crate) max_height: Option<f32>,
+    pub(crate) fade_edges: Option<[f32; 2]>,
+    pub(crate) border_style: Option<crate::decoration::BorderStyle>,
+    pub(crate) shadows: Option<Option<std::sync::Arc<[BoxShadow]>>>,
+    pub(crate) shadow: Option<Option<BoxShadow>>,
+    pub(crate) letter_spacing: Option<crate::text_layout::LetterSpacing>,
+    pub(crate) text_overflow: Option<crate::text_layout::TextOverflow>,
+    pub(crate) line_clamp: Option<Option<std::num::NonZeroU32>>,
+    pub(crate) font_features: Option<crate::text_layout::FontFeatures>,
+    pub(crate) font_fallbacks: Option<std::sync::Arc<[crate::text_layout::FontFamily]>>,
+}
+impl RareStyles {
+    const NONE: Self = Self {
+        min_width: None,
+        max_width: None,
+        min_height: None,
+        max_height: None,
+        fade_edges: None,
+        border_style: None,
+        shadows: None,
+        shadow: None,
+        letter_spacing: None,
+        text_overflow: None,
+        line_clamp: None,
+        font_features: None,
+        font_fallbacks: None,
+    };
+    /// Overlay explicitly supplied properties, preserving all others.
+    fn merge(&mut self, other: &Self) {
+        if other.min_width.is_some() {
+            self.min_width = other.min_width;
+        }
+        if other.max_width.is_some() {
+            self.max_width = other.max_width;
+        }
+        if other.min_height.is_some() {
+            self.min_height = other.min_height;
+        }
+        if other.max_height.is_some() {
+            self.max_height = other.max_height;
+        }
+        if other.fade_edges.is_some() {
+            self.fade_edges = other.fade_edges;
+        }
+        if other.border_style.is_some() {
+            self.border_style = other.border_style;
+        }
+        if other.shadows.is_some() {
+            self.shadows = other.shadows.clone();
+        }
+        if other.shadow.is_some() {
+            self.shadow = other.shadow;
+        }
+        if other.letter_spacing.is_some() {
+            self.letter_spacing = other.letter_spacing;
+        }
+        if other.text_overflow.is_some() {
+            self.text_overflow = other.text_overflow;
+        }
+        if other.line_clamp.is_some() {
+            self.line_clamp = other.line_clamp;
+        }
+        if other.font_features.is_some() {
+            self.font_features = other.font_features.clone();
+        }
+        if other.font_fallbacks.is_some() {
+            self.font_fallbacks = other.font_fallbacks.clone();
+        }
+    }
+}
+static NO_RARE: RareStyles = RareStyles::NONE;
 impl Styles {
+    pub(crate) fn rare(&self) -> &RareStyles {
+        self.rare.as_deref().unwrap_or(&NO_RARE)
+    }
+    pub(crate) fn rare_mut(&mut self) -> &mut RareStyles {
+        std::sync::Arc::make_mut(self.rare.get_or_insert_with(Default::default))
+    }
+    /// Whether any typography field (what text inherits) is set.
+    pub(crate) fn sets_typography(&self) -> bool {
+        self.rare().text_overflow.is_some()
+            || self.rare().line_clamp.is_some()
+            || self.text_color.is_some()
+            || self.text_size.is_some()
+            || self.text_wrap.is_some()
+            || self.font_family.is_some()
+            || self.rare().font_features.is_some()
+            || self.text_align.is_some()
+            || self.rare().font_fallbacks.is_some()
+            || self.font_weight.is_some()
+            || self.italic.is_some()
+            || self.line_height.is_some()
+            || self.rare().letter_spacing.is_some()
+    }
     pub(crate) fn layout_options_mut(&mut self) -> &mut crate::layout::LayoutOptions {
         std::sync::Arc::make_mut(self.layout_options.get_or_insert_with(Default::default))
     }
@@ -135,10 +226,10 @@ impl Styles {
         if let Some(options) = &mut self.layout_options
             && (other.gap.is_some()
                 || other.clip.is_some()
-                || other.min_width.is_some()
-                || other.max_width.is_some()
-                || other.min_height.is_some()
-                || other.max_height.is_some()
+                || other.rare().min_width.is_some()
+                || other.rare().max_width.is_some()
+                || other.rare().min_height.is_some()
+                || other.rare().max_height.is_some()
                 || other.layout.is_some())
         {
             let options = std::sync::Arc::make_mut(options);
@@ -150,16 +241,16 @@ impl Styles {
                 options.clip_x = None;
                 options.clip_y = None;
             }
-            if other.min_width.is_some() {
+            if other.rare().min_width.is_some() {
                 options.min_width = None;
             }
-            if other.max_width.is_some() {
+            if other.rare().max_width.is_some() {
                 options.max_width = None;
             }
-            if other.min_height.is_some() {
+            if other.rare().min_height.is_some() {
                 options.min_height = None;
             }
-            if other.max_height.is_some() {
+            if other.rare().max_height.is_some() {
                 options.max_height = None;
             }
             if other.layout.is_some() {
@@ -176,6 +267,21 @@ impl Styles {
             } else {
                 self.layout_options = Some(options.clone());
             }
+        }
+        if let Some(rare) = &other.rare {
+            match &mut self.rare {
+                Some(own) => std::sync::Arc::make_mut(own).merge(rare),
+                None => self.rare = Some(rare.clone()),
+            }
+        }
+        if other.paint_background.is_some() {
+            self.paint_background = other.paint_background.clone();
+        }
+        if other.corners.is_some() {
+            self.corners = other.corners;
+        }
+        if other.border_edges.is_some() {
+            self.border_edges = other.border_edges;
         }
         if other.object_fit.is_some() {
             self.object_fit = other.object_fit;
@@ -194,26 +300,11 @@ impl Styles {
             self.height = other.height;
             self.height_percent = other.height_percent;
         }
-        if other.min_width.is_some() {
-            self.min_width = other.min_width;
-        }
-        if other.max_width.is_some() {
-            self.max_width = other.max_width;
-        }
-        if other.min_height.is_some() {
-            self.min_height = other.min_height;
-        }
-        if other.max_height.is_some() {
-            self.max_height = other.max_height;
-        }
         if other.gap.is_some() {
             self.gap = other.gap;
         }
         if other.clip.is_some() {
             self.clip = other.clip;
-        }
-        if other.fade_edges.is_some() {
-            self.fade_edges = other.fade_edges;
         }
         if other.flex_grow.is_some() {
             self.flex_grow = other.flex_grow;
@@ -230,21 +321,6 @@ impl Styles {
         if other.text_wrap.is_some() {
             self.text_wrap = other.text_wrap;
         }
-        if other.paint_background.is_some() {
-            self.paint_background = other.paint_background.clone();
-        }
-        if other.corners.is_some() {
-            self.corners = other.corners;
-        }
-        if other.border_edges.is_some() {
-            self.border_edges = other.border_edges;
-        }
-        if other.border_style.is_some() {
-            self.border_style = other.border_style;
-        }
-        if other.shadows.is_some() {
-            self.shadows = other.shadows.clone();
-        }
         if other.cursor.is_some() {
             self.cursor = other.cursor;
         }
@@ -254,20 +330,8 @@ impl Styles {
         if other.text_color.is_some() {
             self.text_color = other.text_color;
         }
-        if other.font_fallbacks.is_some() {
-            self.font_fallbacks = other.font_fallbacks.clone();
-        }
-        if other.text_overflow.is_some() {
-            self.text_overflow = other.text_overflow;
-        }
-        if other.line_clamp.is_some() {
-            self.line_clamp = other.line_clamp;
-        }
         if other.text_align.is_some() {
             self.text_align = other.text_align;
-        }
-        if other.font_features.is_some() {
-            self.font_features = other.font_features.clone();
         }
         if other.font_family.is_some() {
             self.font_family = other.font_family.clone();
@@ -284,9 +348,6 @@ impl Styles {
         if other.line_height.is_some() {
             self.line_height = other.line_height;
         }
-        if other.letter_spacing.is_some() {
-            self.letter_spacing = other.letter_spacing;
-        }
         if other.radius.is_some() {
             self.radius = other.radius;
         }
@@ -295,9 +356,6 @@ impl Styles {
         }
         if other.border_color.is_some() {
             self.border_color = other.border_color;
-        }
-        if other.shadow.is_some() {
-            self.shadow = other.shadow;
         }
         if other.opacity.is_some() {
             self.opacity = other.opacity;
@@ -713,28 +771,28 @@ pub trait Styled: Sized {
         if let Some(options) = &mut self.styles_mut().layout_options {
             std::sync::Arc::make_mut(options).min_width = None;
         }
-        self.styles_mut().min_width = Some(value);
+        self.styles_mut().rare_mut().min_width = Some(value);
         self
     }
     fn max_w(mut self, value: f32) -> Self {
         if let Some(options) = &mut self.styles_mut().layout_options {
             std::sync::Arc::make_mut(options).max_width = None;
         }
-        self.styles_mut().max_width = Some(value);
+        self.styles_mut().rare_mut().max_width = Some(value);
         self
     }
     fn min_h(mut self, value: f32) -> Self {
         if let Some(options) = &mut self.styles_mut().layout_options {
             std::sync::Arc::make_mut(options).min_height = None;
         }
-        self.styles_mut().min_height = Some(value);
+        self.styles_mut().rare_mut().min_height = Some(value);
         self
     }
     fn max_h(mut self, value: f32) -> Self {
         if let Some(options) = &mut self.styles_mut().layout_options {
             std::sync::Arc::make_mut(options).max_height = None;
         }
-        self.styles_mut().max_height = Some(value);
+        self.styles_mut().rare_mut().max_height = Some(value);
         self
     }
     fn gap(mut self, value: f32) -> Self {
@@ -779,11 +837,11 @@ pub trait Styled: Sized {
         self
     }
     fn border_style(mut self, style: crate::decoration::BorderStyle) -> Self {
-        self.styles_mut().border_style = Some(style);
+        self.styles_mut().rare_mut().border_style = Some(style);
         self
     }
     fn shadows(mut self, shadows: impl Into<std::sync::Arc<[BoxShadow]>>) -> Self {
-        self.styles_mut().shadows = Some(Some(shadows.into()));
+        self.styles_mut().rare_mut().shadows = Some(Some(shadows.into()));
         self
     }
     fn cursor(mut self, cursor: crate::cursor::Cursor) -> Self {
@@ -804,16 +862,16 @@ pub trait Styled: Sized {
         mut self,
         families: impl Into<std::sync::Arc<[crate::text_layout::FontFamily]>>,
     ) -> Self {
-        self.styles_mut().font_fallbacks = Some(families.into());
+        self.styles_mut().rare_mut().font_fallbacks = Some(families.into());
         self
     }
     fn text_overflow(mut self, overflow: crate::text_layout::TextOverflow) -> Self {
-        self.styles_mut().text_overflow = Some(overflow);
+        self.styles_mut().rare_mut().text_overflow = Some(overflow);
         self
     }
     /// Clamp displayed visual lines; zero removes an inherited clamp.
     fn line_clamp(mut self, lines: u32) -> Self {
-        self.styles_mut().line_clamp = Some(std::num::NonZeroU32::new(lines));
+        self.styles_mut().rare_mut().line_clamp = Some(std::num::NonZeroU32::new(lines));
         self
     }
     fn truncate(self) -> Self {
@@ -826,7 +884,7 @@ pub trait Styled: Sized {
     }
     /// Override inherited OpenType features; an empty set restores font defaults.
     fn font_features(mut self, features: crate::text_layout::FontFeatures) -> Self {
-        self.styles_mut().font_features = Some(features);
+        self.styles_mut().rare_mut().font_features = Some(features);
         self
     }
     fn font_family(mut self, family: impl Into<crate::text_layout::FontFamily>) -> Self {
@@ -862,7 +920,7 @@ pub trait Styled: Sized {
     /// Inherited extra glyph advance in logical pixels. Zero resets inherited tracking.
     /// Non-finite values normalize to zero; finite values clamp to ±1,000,000 pixels.
     fn letter_spacing(mut self, pixels: f32) -> Self {
-        self.styles_mut().letter_spacing = Some(crate::text_layout::LetterSpacing::px(pixels));
+        self.styles_mut().rare_mut().letter_spacing = Some(crate::text_layout::LetterSpacing::px(pixels));
         self
     }
 
@@ -1164,7 +1222,7 @@ pub trait Styled: Sized {
     /// Fade content out over `top` and `bottom` bands at the edges of this
     /// node's clip (with `overflow_hidden` or a scroll view), per pixel.
     fn fade_edges(mut self, top: f32, bottom: f32) -> Self {
-        self.styles_mut().fade_edges = Some([top, bottom]);
+        self.styles_mut().rare_mut().fade_edges = Some([top, bottom]);
         self
     }
     fn overflow_hidden(mut self) -> Self {
@@ -1211,13 +1269,13 @@ pub trait Styled: Sized {
         self.flex_shrink(0.)
     }
     fn shadow(mut self, value: BoxShadow) -> Self {
-        self.styles_mut().shadow = Some(Some(value));
-        self.styles_mut().shadows = Some(None);
+        self.styles_mut().rare_mut().shadow = Some(Some(value));
+        self.styles_mut().rare_mut().shadows = Some(None);
         self
     }
     fn shadow_none(mut self) -> Self {
-        self.styles_mut().shadow = Some(None);
-        self.styles_mut().shadows = Some(None);
+        self.styles_mut().rare_mut().shadow = Some(None);
+        self.styles_mut().rare_mut().shadows = Some(None);
         self
     }
     fn translate(mut self, x: f32, y: f32) -> Self {
@@ -1369,7 +1427,7 @@ mod tests {
                     .overflow_visible()
                     .isolated(false),
             );
-        assert_eq!(style.shadow, Some(None));
+        assert_eq!(style.rare().shadow, Some(None));
         assert_eq!(style.clip, Some(false));
         assert_eq!(style.isolated, Some(false));
         assert_eq!(rgb(0x102030), Color(16, 32, 48, 255));

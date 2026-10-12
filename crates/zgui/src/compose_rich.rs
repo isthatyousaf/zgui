@@ -82,11 +82,11 @@ impl TextSpan {
         self
     }
     pub fn font_fallbacks(mut self, families: impl Into<std::sync::Arc<[FontFamily]>>) -> Self {
-        self.styles.font_fallbacks = Some(families.into());
+        self.styles.rare_mut().font_fallbacks = Some(families.into());
         self
     }
     pub fn font_features(mut self, features: crate::text_layout::FontFeatures) -> Self {
-        self.styles.font_features = Some(features);
+        self.styles.rare_mut().font_features = Some(features);
         self
     }
     pub fn font_family(mut self, family: impl Into<FontFamily>) -> Self {
@@ -113,7 +113,7 @@ impl TextSpan {
         self
     }
     pub fn letter_spacing(mut self, px: f32) -> Self {
-        self.styles.letter_spacing = Some(LetterSpacing::px(px));
+        self.styles.rare_mut().letter_spacing = Some(LetterSpacing::px(px));
         self
     }
 }
