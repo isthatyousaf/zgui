@@ -87,7 +87,14 @@ pub fn connect() -> impl Future<Output = Result<Rpc, String>> {
     std::thread::Builder::new()
         .name("zeron-ipc".into())
         .spawn(move || {
-            let mut socket = match tungstenite::connect(engine_url()) {
+            // A long session's snapshot can pass tungstenite's 16 MiB default
+            // in one message; local IPC allows up to 256 MiB.
+            const LIMIT: usize = 256 << 20;
+            let config = tungstenite::protocol::WebSocketConfig::default()
+                .max_message_size(Some(LIMIT))
+                .max_frame_size(Some(LIMIT));
+            let connected = tungstenite::client::connect_with_config(engine_url(), Some(config), 3);
+            let mut socket = match connected {
                 Ok((socket, _)) => socket,
                 Err(error) => {
                     open(Err(error.to_string()));

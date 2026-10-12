@@ -505,7 +505,8 @@ struct LayerCache {
 struct Draw {
     /// How its quads are drawn; set by `push_draw`.
     shading: Shading,
-    blur: Option<(Rect, zgui::scene::Effects)>,
+    /// A backdrop filter: its bounds, effects and corner radii.
+    blur: Option<(Rect, zgui::scene::Effects, [f32; 4])>,
     start: u32,
     end: u32,
     clip: Rect,
@@ -2058,7 +2059,11 @@ impl GpuRenderer {
                     bounds: quad_bounds(&quads[start as usize..]),
                     image: None,
                     layer: Some(item.id),
-                    blur: (item.effects.blur_radius > 0.).then_some((item.bounds, item.effects)),
+                    blur: (item.effects.blur_radius > 0.).then_some((
+                        item.bounds,
+                        item.effects,
+                        blur_corners(item.kind, item.bounds),
+                    )),
                 });
                 continue;
             }
@@ -2650,7 +2655,11 @@ impl GpuRenderer {
                 let draw = Draw {
                     shading: Shading::Full,
                     layer: None,
-                    blur: (item.effects.blur_radius > 0.).then_some((bounds, item.effects)),
+                    blur: (item.effects.blur_radius > 0.).then_some((
+                        bounds,
+                        item.effects,
+                        blur_corners(item.kind, item.bounds),
+                    )),
                     start,
                     end: quads.len() as u32,
                     clip: draw_clip,
@@ -2801,7 +2810,7 @@ impl GpuRenderer {
         // must not force every unrelated quad into its own render pass.
         let has_damaged_blur = has_blur
             && draws.iter().any(|draw| {
-                draw.blur.is_some_and(|(bounds, _)| {
+                draw.blur.is_some_and(|(bounds, _, _)| {
                     damage.iter().any(|region| {
                         region
                             .intersection(draw.clip)
@@ -2813,7 +2822,7 @@ impl GpuRenderer {
             });
         // The part of a filter's output inside `region`, if it reaches it.
         let filtered = |draw: &Draw, region: &Rect| {
-            let (bounds, _) = draw.blur?;
+            let (bounds, _, _) = draw.blur?;
             region.intersection(draw.clip)?.intersection(bounds)
         };
         // A filter samples everything painted before it, so each filter a
@@ -2930,11 +2939,11 @@ impl GpuRenderer {
             let Some(draw) = draws.get(end) else {
                 break;
             };
-            let (bounds, effects) = draw.blur.expect("split at a filter");
+            let (bounds, effects, corners) = draw.blur.expect("split at a filter");
             let outputs = regions
                 .iter()
                 .filter_map(|(region, _)| filtered(draw, region));
-            vertical = self.blur(&mut encoder, bounds, draw.clip, outputs, effects);
+            vertical = self.blur(&mut encoder, bounds, draw.clip, outputs, effects, corners);
             if let Some(blur) = &vertical {
                 stats.draw_calls += blur.scissors.len();
                 stats.render_passes += 1;
@@ -3537,6 +3546,7 @@ impl GpuRenderer {
         clip: Rect,
         outputs: impl IntoIterator<Item = Rect>,
         effects: zgui::scene::Effects,
+        corners: [f32; 4],
     ) -> Option<VerticalBlur> {
         let sigma = (effects.blur_radius * self.scale).clamp(0.1, 64.);
         let radius = (sigma * 3.).ceil() as u32;
@@ -3578,7 +3588,7 @@ impl GpuRenderer {
         let source_view = source.create_view(&Default::default());
         let intermediate_view = intermediate.create_view(&Default::default());
         let uniform = |vertical: bool| {
-            let params: [f32; 16] = [
+            let params: [f32; 20] = [
                 if vertical { 0. } else { 1. },
                 if vertical { 1. } else { 0. },
                 sigma,
@@ -3596,6 +3606,10 @@ impl GpuRenderer {
                 ay as f32,
                 (ax + aw) as f32,
                 (ay + ah) as f32,
+                corners[0] * self.scale,
+                corners[1] * self.scale,
+                corners[2] * self.scale,
+                corners[3] * self.scale,
             ];
             upload::init_buffer(
                 &self.device,
@@ -4856,6 +4870,16 @@ fn crosses(quad: &Quad, clip: Rect) -> bool {
     let outside =
         x + w <= clip.x || y + h <= clip.y || x >= clip.x + clip.width || y >= clip.y + clip.height;
     !outside && !inside(quad, clip)
+}
+/// A backdrop filter's corner radii (top-left, top-right, bottom-right,
+/// bottom-left): a rounded panel blurs only inside its own curve.
+fn blur_corners(kind: &NodeKind, bounds: Rect) -> [f32; 4] {
+    match kind {
+        NodeKind::Panel { quad, .. } | NodeKind::Quad(quad) => {
+            decoration::shadow_corners(quad, bounds.width, bounds.height, 0.)
+        }
+        _ => [0.; 4],
+    }
 }
 fn scissor(r: Rect, scale: f32, width: u32, height: u32) -> Option<(u32, u32, u32, u32)> {
     let x = (r.x * scale).floor().max(0.) as u32;

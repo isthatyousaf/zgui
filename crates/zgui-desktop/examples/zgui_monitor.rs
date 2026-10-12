@@ -1,6 +1,8 @@
 //! Glass resource monitor: launches the kitchen sink, or another example with
-//! `--app <example>` (or attaches with `--pid <pid>`), and charts CPU and
-//! memory over the last minute for any process on the machine.
+//! `--app <example>` (or attaches with `--pid <pid>`), and charts CPU, GPU and
+//! memory over the last minute for any process on the machine. GPU time per
+//! process comes from the GPU driver's per-client accounting (macOS: each
+//! `AGXDeviceUserClient`'s `AppUsage`), the way Activity Monitor reads it.
 //!
 //! The sidebar lists every readable process. ↑/↓ browse it in the active
 //! panel, Enter (or a row's +) splits a new panel beside it so the previous one
@@ -55,6 +57,7 @@ const ROW: f32 = 44.;
 // Dark-surface steps of the reference categorical palette: one hue per chart.
 const CPU_HUE: u32 = 0x3987e5;
 const MEMORY_HUE: u32 = 0x199e70;
+const GPU_HUE: u32 = 0xe5793a;
 const ACCENT: u32 = 0x8b7cf6;
 const MUTED: u32 = 0xffffff8c;
 const FAINT: u32 = 0xffffff14;
@@ -63,6 +66,8 @@ const HAIRLINE: u32 = 0xffffff1f;
 #[derive(Clone, Copy, PartialEq)]
 struct Sample {
     cpu: f32,
+    /// Percent of one GPU's time, like `cpu` is of one core's.
+    gpu: f32,
     memory_mb: f32,
 }
 
@@ -72,6 +77,7 @@ struct Proc {
     pid: i32,
     name: Rc<str>,
     cpu: f32,
+    gpu: f32,
     memory_mb: f32,
     /// Smoothed CPU for a sort order that doesn't jitter every sample.
     smooth: f32,
@@ -82,6 +88,8 @@ struct Track {
     start: u64,
     name: Rc<str>,
     cpu_ns: u64,
+    /// Accumulated GPU time, if the process has ever used the GPU.
+    gpu_ns: Option<u64>,
     at: Instant,
     smooth: f32,
     samples: VecDeque<Sample>,
@@ -90,6 +98,7 @@ struct Track {
 #[derive(Clone, Copy, PartialEq)]
 enum Sort {
     Cpu,
+    Gpu,
     Memory,
     Name,
 }
@@ -127,6 +136,8 @@ struct App {
     hint: Signal<Option<(u64, Zone)>>,
     query: Signal<String>,
     sort: Signal<Sort>,
+    /// The whole GPU's utilisation, where the driver reports it.
+    device_gpu: Signal<Option<f32>>,
     list_offset: Signal<f32>,
     /// The pointer is over the list: hold its order still under the cursor.
     hovering: Rc<Cell<bool>>,
@@ -351,6 +362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hint: cx.ui.signal(None),
                 query: cx.ui.signal(String::new()),
                 sort: cx.ui.signal(Sort::Cpu),
+                device_gpu: cx.ui.signal(None),
                 list_offset: cx.ui.signal(0.),
                 hovering: Rc::default(),
                 held_until: Rc::new(Cell::new(Instant::now())),
@@ -373,7 +385,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // new ones join the end. Filter and sort changes re-sort.
                     let steady =
                         last.replace((needle.clone(), sort)) == Some((needle.clone(), sort));
-                    let mut rows: Vec<(i32, Rc<str>, f32, f32)> = app.procs.with(|procs| {
+                    let mut rows: Vec<(i32, Rc<str>, f32, f32, f32)> = app.procs.with(|procs| {
                         procs
                             .iter()
                             .filter(|p| {
@@ -381,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     || p.name.to_lowercase().contains(&needle)
                                     || p.pid.to_string().starts_with(&needle)
                             })
-                            .map(|p| (p.pid, p.name.clone(), p.smooth, p.memory_mb))
+                            .map(|p| (p.pid, p.name.clone(), p.smooth, p.memory_mb, p.gpu))
                             .collect()
                     });
                     let held = app.hovering.get()
@@ -403,6 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     rows.sort_by(|a, b| match sort {
                         Sort::Cpu => b.2.total_cmp(&a.2).then_with(|| b.3.total_cmp(&a.3)),
+                        Sort::Gpu => b.4.total_cmp(&a.4).then_with(|| b.2.total_cmp(&a.2)),
                         Sort::Memory => b.3.total_cmp(&a.3),
                         Sort::Name => a.1.to_lowercase().cmp(&b.1.to_lowercase()),
                     });
@@ -505,8 +518,10 @@ fn spawn_sampler(tasks: &zgui_desktop::TaskSpawner, app: App) {
                 .slots
                 .with_untracked(|s| s.iter().filter_map(|s| s.pid).collect());
             let procs = sample(&mut app.tracks.borrow_mut(), &open);
+            let device = usage::device_gpu();
             app.runtime.batch(|| {
                 app.procs.set(procs);
+                app.device_gpu.set(device);
                 app.tick.update(|t| *t += 1);
             });
             sleep(INTERVAL).await;
@@ -518,6 +533,7 @@ fn sample(tracks: &mut HashMap<i32, Track>, open: &HashSet<i32>) -> Vec<Proc> {
     let now = Instant::now();
     let mut seen = HashSet::new();
     let mut procs = Vec::new();
+    let gpu_times = usage::gpu_times();
     for pid in usage::pids() {
         let Some(usage) = usage::read(pid) else {
             continue;
@@ -534,6 +550,7 @@ fn sample(tracks: &mut HashMap<i32, Track>, open: &HashSet<i32>) -> Vec<Proc> {
                         start: usage.start,
                         name: usage::name(pid).into(),
                         cpu_ns: usage.cpu_ns,
+                        gpu_ns: gpu_times.get(&pid).copied(),
                         at: now,
                         smooth: 0.,
                         samples: VecDeque::new(),
@@ -544,6 +561,7 @@ fn sample(tracks: &mut HashMap<i32, Track>, open: &HashSet<i32>) -> Vec<Proc> {
                     pid,
                     name: track.name.clone(),
                     cpu: 0.,
+                    gpu: 0.,
                     memory_mb,
                     smooth: 0.,
                 });
@@ -553,16 +571,28 @@ fn sample(tracks: &mut HashMap<i32, Track>, open: &HashSet<i32>) -> Vec<Proc> {
         let wall = now.duration_since(track.at).as_nanos().max(1) as f64;
         let cpu = (usage.cpu_ns.saturating_sub(track.cpu_ns) as f64 / wall * 100.) as f32;
         track.cpu_ns = usage.cpu_ns;
+        let gpu_ns = gpu_times.get(&pid).copied();
+        // A process that closes its last GPU client drops back to zero.
+        let gpu = match (gpu_ns, track.gpu_ns) {
+            (Some(now_ns), Some(then)) => (now_ns.saturating_sub(then) as f64 / wall * 100.) as f32,
+            _ => 0.,
+        };
+        track.gpu_ns = gpu_ns;
         track.at = now;
         track.smooth = track.smooth * 0.8 + cpu * 0.2;
         if track.samples.len() == CAPACITY {
             track.samples.pop_front();
         }
-        track.samples.push_back(Sample { cpu, memory_mb });
+        track.samples.push_back(Sample {
+            cpu,
+            gpu,
+            memory_mb,
+        });
         procs.push(Proc {
             pid,
             name: track.name.clone(),
             cpu,
+            gpu,
             memory_mb,
             smooth: track.smooth,
         });
@@ -659,6 +689,7 @@ fn sidebar(app: &App, window: WindowHandle) -> View {
         row()
             .gap(2.)
             .child(option("CPU", Sort::Cpu))
+            .child(option("GPU", Sort::Gpu))
             .child(option("MEM", Sort::Memory))
             .child(option("A–Z", Sort::Name))
     };
@@ -685,7 +716,7 @@ fn sidebar(app: &App, window: WindowHandle) -> View {
         })
     };
     let footer = {
-        let procs = app.procs.clone();
+        let (procs, device_gpu) = (app.procs.clone(), app.device_gpu.clone());
         row()
             .w_full()
             .h(FOOTER)
@@ -701,9 +732,15 @@ fn sidebar(app: &App, window: WindowHandle) -> View {
             .border_color(white(22))
             .child(
                 text_signal(move || {
+                    let device = device_gpu.get();
                     procs.with(|p| {
                         let cpu: f32 = p.iter().map(|p| p.cpu).sum();
-                        format!("{} processes · {cpu:.0}% CPU", p.len())
+                        match device {
+                            Some(gpu) => {
+                                format!("{} processes · {cpu:.0}% CPU · {gpu:.0}% GPU", p.len())
+                            }
+                            None => format!("{} processes · {cpu:.0}% CPU", p.len()),
+                        }
                     })
                 })
                 .text_size(11.)
@@ -770,9 +807,14 @@ fn process_row(app: &App, pid: i32) -> View {
         let proc = proc.clone();
         let launched = app.launched == Some(pid);
         text_signal(move || {
-            let memory = proc().map_or(0., |p| p.memory_mb);
+            let (memory, gpu) = proc().map_or((0., 0.), |p| (p.memory_mb, p.gpu));
+            let gpu = if gpu >= 0.05 {
+                format!(" · GPU {gpu:.1}%")
+            } else {
+                String::new()
+            };
             let tag = if launched { " · launched" } else { "" };
-            format!("{pid} · {memory:.0} MB{tag}")
+            format!("{pid} · {memory:.0} MB{gpu}{tag}")
         })
         .text_size(10.5)
         .text_color(rgba(MUTED))
@@ -1211,6 +1253,18 @@ fn panel_body(cx: &mut Context, app: &App, pid: i32) -> View {
             ))
             .child(chart(
                 ChartSpec {
+                    title: "GPU",
+                    unit: "%",
+                    hue: GPU_HUE,
+                    value: |s| s.gpu,
+                    floor: 10.,
+                },
+                &samples,
+                &hover,
+                app.scene.clone(),
+            ))
+            .child(chart(
+                ChartSpec {
                     title: "MEMORY",
                     unit: " MB",
                     hue: MEMORY_HUE,
@@ -1258,6 +1312,22 @@ fn stat_grid(samples: &Signal<VecDeque<Sample>>) -> View {
                         format!(
                             "{:.1}%",
                             s.iter().map(|s| s.cpu).sum::<f32>() / s.len() as f32
+                        )
+                    })
+                })),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(10.)
+                .child(stat("GPU NOW", |s| {
+                    s.back().map(|s| format!("{:.1}%", s.gpu))
+                }))
+                .child(stat("GPU AVG · 60 S", |s| {
+                    (!s.is_empty()).then(|| {
+                        format!(
+                            "{:.1}%",
+                            s.iter().map(|s| s.gpu).sum::<f32>() / s.len() as f32
                         )
                     })
                 })),
@@ -1628,10 +1698,252 @@ mod usage {
             start: info.proc_start_abstime,
         })
     }
+
+    // GPU time per process -----------------------------------------------------
+    //
+    // The GPU driver keeps per-client accounting in the IORegistry: every
+    // `AGXDeviceUserClient` names its creator ("pid 395, WindowServer") and
+    // lists `AppUsage` entries with `accumulatedGPUTime` in nanoseconds.
+    // `IOAccelerator`'s `PerformanceStatistics` hold the device-wide
+    // "Device Utilization %". Both are readable without privileges.
+    use std::{
+        collections::HashMap,
+        ffi::{CStr, c_char, c_void},
+    };
+    type CfType = *const c_void;
+    #[link(name = "IOKit", kind = "framework")]
+    unsafe extern "C" {
+        fn IOServiceMatching(name: *const c_char) -> *mut c_void;
+        fn IOServiceGetMatchingServices(main: u32, matching: *mut c_void, it: *mut u32) -> i32;
+        fn IOIteratorNext(it: u32) -> u32;
+        fn IOObjectRelease(object: u32) -> i32;
+        fn IORegistryEntryGetChildIterator(entry: u32, plane: *const c_char, it: *mut u32) -> i32;
+        fn IORegistryEntryCreateCFProperty(
+            entry: u32,
+            key: CfType,
+            allocator: CfType,
+            options: u32,
+        ) -> CfType;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: CfType,
+            text: *const c_char,
+            encoding: u32,
+        ) -> CfType;
+        fn CFStringGetCString(
+            text: CfType,
+            buffer: *mut c_char,
+            size: isize,
+            encoding: u32,
+        ) -> bool;
+        fn CFGetTypeID(object: CfType) -> usize;
+        fn CFStringGetTypeID() -> usize;
+        fn CFArrayGetTypeID() -> usize;
+        fn CFDictionaryGetTypeID() -> usize;
+        fn CFNumberGetTypeID() -> usize;
+        fn CFArrayGetCount(array: CfType) -> isize;
+        fn CFArrayGetValueAtIndex(array: CfType, index: isize) -> CfType;
+        fn CFDictionaryGetValue(dictionary: CfType, key: CfType) -> CfType;
+        fn CFNumberGetValue(number: CfType, kind: isize, value: *mut c_void) -> bool;
+        fn CFRelease(object: CfType);
+    }
+    const UTF8: u32 = 0x0800_0100;
+    const SINT64: isize = 4;
+
+    /// An owned CFString key.
+    struct Key(CfType);
+    impl Key {
+        fn new(text: &CStr) -> Self {
+            // SAFETY: a NUL-terminated UTF-8 string; released in Drop.
+            Self(unsafe { CFStringCreateWithCString(std::ptr::null(), text.as_ptr(), UTF8) })
+        }
+    }
+    impl Drop for Key {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: created above and not shared.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    /// Calls `visit` with each registry entry of `class`, then releases it.
+    fn each_service(class: &CStr, mut visit: impl FnMut(u32)) {
+        let mut iterator = 0_u32;
+        // SAFETY: `IOServiceGetMatchingServices` consumes the matching
+        // dictionary; the iterator and entries are released here.
+        unsafe {
+            let matching = IOServiceMatching(class.as_ptr());
+            if matching.is_null() || IOServiceGetMatchingServices(0, matching, &mut iterator) != 0 {
+                return;
+            }
+            loop {
+                let entry = IOIteratorNext(iterator);
+                if entry == 0 {
+                    break;
+                }
+                visit(entry);
+                IOObjectRelease(entry);
+            }
+            IOObjectRelease(iterator);
+        }
+    }
+
+    /// Calls `visit` with each child of `entry` in the service plane. User
+    /// clients are not registered services, so matching can't find them;
+    /// they hang off their accelerator like `ioreg` shows.
+    fn each_child(entry: u32, mut visit: impl FnMut(u32)) {
+        let mut iterator = 0_u32;
+        // SAFETY: a valid entry; the iterator and children are released.
+        unsafe {
+            if IORegistryEntryGetChildIterator(entry, c"IOService".as_ptr(), &mut iterator) != 0 {
+                return;
+            }
+            loop {
+                let child = IOIteratorNext(iterator);
+                if child == 0 {
+                    break;
+                }
+                visit(child);
+                IOObjectRelease(child);
+            }
+            IOObjectRelease(iterator);
+        }
+    }
+
+    /// A copied property of `entry`, released when dropped.
+    struct Property(CfType);
+    impl Property {
+        fn of(entry: u32, key: &Key) -> Option<Self> {
+            // SAFETY: a valid entry and key; the result is owned (Create rule).
+            let value =
+                unsafe { IORegistryEntryCreateCFProperty(entry, key.0, std::ptr::null(), 0) };
+            (!value.is_null()).then_some(Self(value))
+        }
+    }
+    impl Drop for Property {
+        fn drop(&mut self) {
+            // SAFETY: owned since `of`.
+            unsafe { CFRelease(self.0) };
+        }
+    }
+
+    fn is(object: CfType, type_id: usize) -> bool {
+        // SAFETY: a valid CF object.
+        !object.is_null() && unsafe { CFGetTypeID(object) } == type_id
+    }
+
+    fn number(object: CfType) -> Option<i64> {
+        // SAFETY: type checked before reading.
+        unsafe {
+            if !is(object, CFNumberGetTypeID()) {
+                return None;
+            }
+            let mut value = 0_i64;
+            CFNumberGetValue(object, SINT64, (&raw mut value).cast()).then_some(value)
+        }
+    }
+
+    fn string(object: CfType) -> Option<String> {
+        // SAFETY: type checked; the buffer is writable for its length.
+        unsafe {
+            if !is(object, CFStringGetTypeID()) {
+                return None;
+            }
+            let mut buffer = [0 as c_char; 256];
+            CFStringGetCString(object, buffer.as_mut_ptr(), buffer.len() as isize, UTF8).then(
+                || {
+                    CStr::from_ptr(buffer.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                },
+            )
+        }
+    }
+
+    /// "pid 395, WindowServer" → 395.
+    pub fn creator_pid(creator: &str) -> Option<i32> {
+        creator
+            .strip_prefix("pid ")?
+            .split(',')
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Accumulated GPU nanoseconds per process with an open GPU client.
+    pub fn gpu_times() -> HashMap<i32, u64> {
+        let (creator_key, usage_key, time_key) = (
+            Key::new(c"IOUserClientCreator"),
+            Key::new(c"AppUsage"),
+            Key::new(c"accumulatedGPUTime"),
+        );
+        let mut times = HashMap::new();
+        let mut read = |entry: u32| {
+            let Some(pid) = Property::of(entry, &creator_key)
+                .and_then(|creator| string(creator.0))
+                .and_then(|creator| creator_pid(&creator))
+            else {
+                return;
+            };
+            let Some(usage) = Property::of(entry, &usage_key) else {
+                return;
+            };
+            // SAFETY: type checked; indices are within the count.
+            let total: u64 = unsafe {
+                if !is(usage.0, CFArrayGetTypeID()) {
+                    return;
+                }
+                (0..CFArrayGetCount(usage.0))
+                    .map(|i| CFArrayGetValueAtIndex(usage.0, i))
+                    .filter(|item| is(*item, CFDictionaryGetTypeID()))
+                    .filter_map(|item| number(CFDictionaryGetValue(item, time_key.0)))
+                    .map(|ns| ns.max(0) as u64)
+                    .sum()
+            };
+            *times.entry(pid).or_insert(0) += total;
+        };
+        each_service(c"IOAccelerator", |accelerator| {
+            each_child(accelerator, &mut read)
+        });
+        times
+    }
+
+    /// The GPU's own "Device Utilization %", if the driver reports it.
+    pub fn device_gpu() -> Option<f32> {
+        let (stats_key, utilization_key) = (
+            Key::new(c"PerformanceStatistics"),
+            Key::new(c"Device Utilization %"),
+        );
+        let mut found = None;
+        each_service(c"IOAccelerator", |entry| {
+            if found.is_some() {
+                return;
+            }
+            if let Some(stats) = Property::of(entry, &stats_key)
+                && is(stats.0, unsafe { CFDictionaryGetTypeID() })
+            {
+                // SAFETY: a dictionary, checked above.
+                found = number(unsafe { CFDictionaryGetValue(stats.0, utilization_key.0) })
+                    .map(|percent| percent as f32);
+            }
+        });
+        found
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod usage {
+    /// No per-process GPU accounting here yet.
+    pub fn gpu_times() -> std::collections::HashMap<i32, u64> {
+        std::collections::HashMap::new()
+    }
+    pub fn device_gpu() -> Option<f32> {
+        None
+    }
     pub struct Usage {
         pub cpu_ns: u64,
         pub footprint: u64,
@@ -1663,5 +1975,24 @@ mod usage {
             footprint: pages * 4096,
             start: fields.get(19)?.parse().ok()?,
         })
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::usage;
+
+    #[test]
+    fn creator_names_its_pid() {
+        assert_eq!(usage::creator_pid("pid 395, WindowServer"), Some(395));
+        assert_eq!(usage::creator_pid("pid 7,x"), Some(7));
+        assert_eq!(usage::creator_pid("WindowServer"), None);
+    }
+
+    #[test]
+    fn window_server_has_gpu_time() {
+        // Every logged-in Mac composites through WindowServer on the GPU.
+        let times = usage::gpu_times();
+        assert!(times.values().any(|ns| *ns > 0), "no GPU accounting read");
     }
 }

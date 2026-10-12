@@ -21,6 +21,8 @@ pub struct ChatRow {
     pub title: String,
     pub project: String,
     pub space_id: Option<String>,
+    /// The project's folder: the seed of its monogram colour.
+    pub space_path: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
     /// Kept whole: `setChatConfig` replaces it and runs copy it.
@@ -75,18 +77,6 @@ pub fn now_seconds() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// "now", "4m", "3h", "2d", "5w".
-pub fn ago(seconds: i64) -> String {
-    let age = (now_seconds() - seconds).max(0);
-    match age {
-        0..60 => "now".into(),
-        60..3600 => format!("{}m", age / 60),
-        3600..86_400 => format!("{}h", age / 3600),
-        86_400..604_800 => format!("{}d", age / 86_400),
-        _ => format!("{}w", age / 604_800),
-    }
-}
-
 /// Join `WatchChats` with `WatchSpaces` project names.
 pub fn chat_rows(chats: &Value, spaces: &HashMap<String, (String, String)>) -> Vec<ChatRow> {
     let mut rows: Vec<ChatRow> = chats
@@ -118,6 +108,7 @@ pub fn chat_rows(chats: &Value, spaces: &HashMap<String, (String, String)>) -> V
                     .map(str::to_owned)
                     .or_else(|| space.map(|(_, path)| path.clone())),
                 branch: str_of(chat, "branch").map(str::to_owned),
+                space_path: space.map(|(_, path)| path.clone()),
                 config: chat.get("config").cloned().unwrap_or(Value::Null),
                 space_id,
                 updated,
@@ -338,6 +329,41 @@ struct Entry {
     streaming: bool,
     parts: Vec<String>,
     born: Option<f32>,
+    /// `createdAt`, in ms since the Unix epoch.
+    created_ms: Option<i64>,
+    /// `continuationOf`: the root entry this one continues (Zeron joins
+    /// continuations into their root before building rows).
+    continuation_of: Option<String>,
+}
+
+/// What a transcript row knows about the entry it belongs to (Zeron's
+/// `Row::entry_id`, `timestamp` and `copy_text`).
+#[derive(Clone, PartialEq, Debug)]
+pub struct EntryInfo {
+    pub id: String,
+    pub role: String,
+    /// `createdAt`, in ms since the Unix epoch.
+    pub created_ms: Option<i64>,
+    /// The entry's last row.
+    pub last: bool,
+    pub streaming: bool,
+}
+
+impl EntryInfo {
+    /// Zeron reserves the hover metadata strip (timestamp, copy) under every
+    /// user bubble and under the last row of a settled assistant entry.
+    pub fn has_strip(&self) -> bool {
+        self.role == "user" || (self.last && !self.streaming)
+    }
+}
+
+/// `createdAt` as ms: a number of ms, or an RFC 3339 string.
+fn created_ms(entry: &Value) -> Option<i64> {
+    match entry.get("createdAt")? {
+        Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        Value::String(s) => unix_seconds(s).map(|s| s * 1000),
+        _ => None,
+    }
 }
 
 /// A row of the transcript: parts of consecutive tool calls and thoughts
@@ -364,6 +390,17 @@ pub struct Transcript {
     pub streaming: Signal<bool>,
     /// Loaded at least once (a reset arrived).
     pub loaded: Signal<bool>,
+    /// The rows carrying a metadata strip (see [`EntryInfo::has_strip`]).
+    /// Set only when the set changes, so rows track it cheaply.
+    pub strips: Signal<HashSet<Block>>,
+    /// The hovered row and its entry: every row of that entry reveals its
+    /// strip. Only the row that set it clears it.
+    pub hovered: Signal<Option<(Block, String)>>,
+    /// Row → its (continuation-joined) entry, each joined entry's last row
+    /// and member entries, as of the last rebuild.
+    block_entry: HashMap<Block, String>,
+    entry_last: HashMap<String, Block>,
+    members: HashMap<String, Vec<String>>,
     now: f32,
     snapshot: bool,
     /// Tool rows born in the current frame, for their stagger.
@@ -378,6 +415,11 @@ impl Transcript {
             blocks: runtime.signal(Vec::new()),
             streaming: runtime.signal(false),
             loaded: runtime.signal(false),
+            strips: runtime.signal(HashSet::new()),
+            hovered: runtime.signal(None),
+            block_entry: HashMap::new(),
+            entry_last: HashMap::new(),
+            members: HashMap::new(),
             runtime,
             order: Vec::new(),
             entries: HashMap::new(),
@@ -389,7 +431,70 @@ impl Transcript {
             staggered: 0,
         }
     }
-    /// When a block first appeared live, for its entrance animation.
+    /// The entry a row belongs to, untracked.
+    pub fn entry_of(&self, block: &Block) -> Option<EntryInfo> {
+        let id = self.block_entry.get(block)?;
+        let entry = self.entries.get(id)?;
+        let streaming = self.members.get(id).map_or(entry.streaming, |members| {
+            members
+                .iter()
+                .any(|m| self.entries.get(m).is_some_and(|e| e.streaming))
+        });
+        Some(EntryInfo {
+            id: id.clone(),
+            role: entry.role.clone(),
+            created_ms: entry.created_ms,
+            last: self.entry_last.get(id) == Some(block),
+            streaming,
+        })
+    }
+
+    /// The text the strip's copy button copies: a user prompt, or an
+    /// assistant entry's non-empty text parts joined by blank lines.
+    pub fn copy_text(&self, entry: &str) -> Option<String> {
+        if let Some(text) = self.user_text.get(entry) {
+            let text = text.with_untracked(String::clone);
+            return (!text.trim().is_empty()).then_some(text);
+        }
+        let members = self
+            .members
+            .get(entry)
+            .cloned()
+            .unwrap_or_else(|| vec![entry.to_owned()]);
+        let text = members
+            .iter()
+            .filter_map(|id| self.entries.get(id))
+            .flat_map(|entry| entry.parts.iter())
+            .filter_map(|key| self.parts.get(key))
+            .filter(|part| part.kind == PartKind::Text)
+            .map(|part| part.text.with_untracked(String::clone))
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
+    /// Recompute which rows carry a strip; notifies only on change.
+    fn refresh_strips(&mut self) {
+        let strips: HashSet<Block> = self
+            .entry_last
+            .values()
+            .chain(
+                self.block_entry
+                    .keys()
+                    .filter(|b| matches!(b, Block::User(_))),
+            )
+            .filter(|block| self.entry_of(block).is_some_and(|info| info.has_strip()))
+            .cloned()
+            .collect();
+        if self.strips.with_untracked(|old| *old != strips) {
+            self.strips.set(strips);
+        }
+    }
+
+    /// When a block first appeared live (rows no longer animate in; kept
+    /// for callers timing other motion).
+    #[allow(dead_code)]
     pub fn born(&self, block: &Block) -> Option<f32> {
         match block {
             Block::User(entry) => self.entries.get(entry).and_then(|e| e.born),
@@ -521,6 +626,9 @@ impl Transcript {
         if structural {
             self.rebuild();
         }
+        if structural || frame.get("upsert").is_some() {
+            self.refresh_strips();
+        }
         let streaming = self
             .order
             .last()
@@ -608,6 +716,8 @@ impl Transcript {
             }
         }
         let streaming = str_of(entry, "status") == Some("streaming");
+        let created_ms =
+            created_ms(entry).or_else(|| self.entries.get(&id).and_then(|e| e.created_ms));
         let born = match self.entries.get(&id) {
             Some(existing) => existing.born,
             None => (!self.snapshot).then_some(self.now),
@@ -619,6 +729,8 @@ impl Transcript {
                 streaming,
                 parts: keys,
                 born,
+                created_ms,
+                continuation_of: str_of(entry, "continuationOf").map(str::to_owned),
             },
         );
         Some(id)
@@ -628,13 +740,40 @@ impl Transcript {
         let mut blocks = Vec::new();
         let mut groups: Vec<(String, Vec<String>)> = Vec::new();
         let mut open_group: Option<usize> = None;
+        let mut block_entry = HashMap::new();
+        let mut entry_last = HashMap::new();
+        let mut members: HashMap<String, Vec<String>> = HashMap::new();
+        // The joined entry being built, and where its rows start.
+        let mut current: Option<(String, usize)> = None;
         for id in &self.order {
             let Some(entry) = self.entries.get(id) else {
                 continue;
             };
+            // A continuation of the entry just before joins it: its rows
+            // share that entry's groups, gaps and strip. Anything else starts
+            // a new entry (groups never span entries).
+            let joined = entry
+                .continuation_of
+                .as_ref()
+                .zip(current.as_ref())
+                .and_then(|(root, (open, _))| {
+                    (root == open && entry.role != "user").then(|| open.clone())
+                });
+            let (root, first) = match joined {
+                Some(root) => (root, current.as_ref().map_or(blocks.len(), |c| c.1)),
+                None => {
+                    open_group = None;
+                    (id.clone(), blocks.len())
+                }
+            };
+            current = Some((root.clone(), first));
+            members.entry(root.clone()).or_default().push(id.clone());
+            let id = &root;
             if entry.role == "user" {
                 open_group = None;
                 blocks.push(Block::User(id.clone()));
+                block_entry.insert(Block::User(id.clone()), id.clone());
+                entry_last.insert(id.clone(), Block::User(id.clone()));
                 continue;
             }
             for key in &entry.parts {
@@ -661,7 +800,16 @@ impl Transcript {
                     PartKind::Other => {}
                 }
             }
+            for block in &blocks[first..] {
+                block_entry.insert(block.clone(), id.clone());
+            }
+            if let Some(last) = blocks[first..].last() {
+                entry_last.insert(id.clone(), last.clone());
+            }
         }
+        self.block_entry = block_entry;
+        self.entry_last = entry_last;
+        self.members = members;
         for (key, members) in groups {
             match self.groups.get(&key) {
                 Some(signal) => {
@@ -673,5 +821,84 @@ impl Transcript {
             }
         }
         self.blocks.set(blocks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn transcript(frame: Value) -> Transcript {
+        let mut t = Transcript::new(Runtime::new());
+        assert!(t.apply(&frame, 0.));
+        t
+    }
+
+    #[test]
+    fn strips_sit_under_user_rows_and_settled_entries_last_rows() {
+        let t = transcript(json!({ "reset": [
+            { "id": "u", "role": "user", "createdAt": 1000, "parts": [{ "kind": "text", "id": "t", "text": "hi" }] },
+            { "id": "a", "role": "assistant", "createdAt": 2000, "status": "complete", "parts": [
+                { "kind": "text", "id": "x", "text": "one" },
+                { "kind": "tool", "id": "y", "call": { "kind": "exec", "command": "ls" } },
+                { "kind": "text", "id": "z", "text": "two" },
+            ]},
+            { "id": "b", "role": "assistant", "createdAt": 3000, "status": "streaming", "parts": [
+                { "kind": "text", "id": "w", "text": "live" },
+            ]},
+        ]}));
+        let strips = t.strips.with_untracked(Clone::clone);
+        assert!(strips.contains(&Block::User("u".into())));
+        assert!(strips.contains(&Block::Text("a/z".into())));
+        assert!(!strips.contains(&Block::Text("a/x".into())));
+        assert!(!strips.contains(&Block::Group("a/y".into())));
+        assert!(!strips.contains(&Block::Text("b/w".into())));
+        let info = t.entry_of(&Block::Text("a/x".into())).unwrap();
+        assert_eq!(
+            (info.id.as_str(), info.created_ms, info.last),
+            ("a", Some(2000), false)
+        );
+        assert_eq!(t.copy_text("a").as_deref(), Some("one\n\ntwo"));
+        assert_eq!(t.copy_text("u").as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn continuations_join_their_root_entry() {
+        let t = transcript(json!({ "reset": [
+            { "id": "a", "role": "assistant", "createdAt": 1, "status": "complete", "parts": [
+                { "kind": "tool", "id": "x", "call": { "kind": "exec", "command": "ls" } },
+            ]},
+            { "id": "c", "role": "assistant", "createdAt": 2, "status": "complete", "continuationOf": "a", "parts": [
+                { "kind": "tool", "id": "y", "call": { "kind": "exec", "command": "pwd" } },
+                { "kind": "text", "id": "z", "text": "done" },
+            ]},
+        ]}));
+        // One group across the join, and one strip under the joined entry.
+        assert_eq!(
+            t.blocks.with_untracked(Clone::clone),
+            vec![Block::Group("a/x".into()), Block::Text("c/z".into())]
+        );
+        assert_eq!(t.entry_of(&Block::Text("c/z".into())).unwrap().id, "a");
+        assert!(
+            t.strips
+                .with_untracked(|s| s.len() == 1 && s.contains(&Block::Text("c/z".into())))
+        );
+    }
+
+    #[test]
+    fn groups_do_not_span_entries() {
+        let t = transcript(json!({ "reset": [
+            { "id": "a", "role": "assistant", "status": "complete", "parts": [
+                { "kind": "tool", "id": "x", "call": { "kind": "exec", "command": "ls" } },
+            ]},
+            { "id": "b", "role": "assistant", "status": "complete", "parts": [
+                { "kind": "tool", "id": "y", "call": { "kind": "exec", "command": "pwd" } },
+            ]},
+        ]}));
+        assert_eq!(
+            t.blocks.with_untracked(Clone::clone),
+            vec![Block::Group("a/x".into()), Block::Group("b/y".into())]
+        );
     }
 }

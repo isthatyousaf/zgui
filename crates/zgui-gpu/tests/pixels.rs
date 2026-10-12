@@ -153,6 +153,46 @@ fn backdrop_blur_reconstructs_without_feedback() {
 }
 
 #[test]
+fn rounded_backdrop_blur_keeps_pixels_outside_its_corners() {
+    let _gpu_fixture = gpu_fixture();
+    let mut gpu = GpuRenderer::new(64, 64).unwrap();
+    let mut s = Scene::new(64., 64.);
+    s.set_kind(s.root(), NodeKind::Container(Layout::Overlay));
+    s.append(
+        s.root(),
+        NodeKind::Rect(Color(0, 0, 0, 255)),
+        fixed(64., 64.),
+    );
+    s.append(
+        s.root(),
+        NodeKind::Rect(Color(255, 255, 255, 255)),
+        fixed(4., 64.),
+    );
+    let glass = s.append(
+        s.root(),
+        NodeKind::Quad(QuadStyle {
+            radius: 20.,
+            ..Default::default()
+        }),
+        fixed(64., 64.),
+    );
+    s.set_effects(
+        glass,
+        Effects {
+            blur_radius: 4.,
+            ..Default::default()
+        },
+    );
+    let d = s.flush().damage;
+    gpu.render(&s, &d).unwrap();
+    let pixels = gpu.readback().unwrap();
+    let at = |x: usize, y: usize| pixels[(y * 64 + x) * 4];
+    assert_eq!(at(1, 1), 255, "outside the corner curve stays sharp");
+    assert!(at(1, 32) < 240, "inside the curve is blurred");
+    assert!(at(8, 32) > 10, "the stripe spreads into the panel");
+}
+
+#[test]
 fn rounded_border_shadow_images_and_background_damage() {
     let _gpu_fixture = gpu_fixture();
     let mut gpu = GpuRenderer::new(80, 60).unwrap();

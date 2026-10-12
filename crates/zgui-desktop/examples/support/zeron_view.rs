@@ -1,48 +1,42 @@
 //! The transcript: user bubbles, streamed markdown under a fading veil, tool
-//! groups with a connector tree, and entrance motion for rows that arrive
-//! live. Layout and motion follow Zeron's `crates/ui/src/transcript.rs` and
-//! `markdown/`; colours are white at graded alpha so glass shows through.
+//! groups with a connector tree, error chips and the hover metadata strip.
+//! Layout and motion follow Zeron's `crates/ui/src/transcript.rs`,
+//! `markdown/render.rs` and `notice.rs`; colours are white at graded alpha so
+//! glass shows through.
 //!
 //! Every animation reads one page clock (`Anim`) that ticks on display frames
 //! only while something moves, so a settled transcript costs nothing.
 
-use super::markdown::{self as md, Align, Change, Piece, Style, Token};
-use super::model::{self, Block, PartKind, Tool};
+use super::markdown::{self as md, Align, Piece, Style, Token};
+use super::model::{self, Block};
 use super::rpc::Rpc;
-use serde_json::json;
-use std::{
-    cell::Cell, collections::HashMap, f32::consts::FRAC_PI_2, rc::Rc, sync::Arc, time::Instant,
-};
+use super::theme::{DANGER_MUTED, FADE_QUICK, Hover, Spec, alpha, hairline, ink, wash};
+use std::{collections::HashMap, rc::Rc, sync::Arc};
 use zgui::{
-    affine::Affine,
     compose::{Tasks, prelude::*},
     cursor::Cursor,
-    frame::FrameClock,
+    input::InputEvent,
     reactive::Signal,
     rich_text::{RichText, TextMeasure, TextRun},
     scene::Color,
-    svg::SvgData,
-    text_layout::{FontFamily, FontStyle, LineHeight},
+    text_layout::{FontStyle, LineHeight},
 };
 
 // Palette ---------------------------------------------------------------------
 
-// Zeron's dark tokens (#e8e8ea / #a9a9ae / #85858a) as white at the alpha
-// that reads the same over glass; accent and status colours as in Zeron.
-pub const TEXT: Color = Color(255, 255, 255, 234);
-pub const BODY: Color = Color(255, 255, 255, 226);
-pub const MUTED: Color = Color(255, 255, 255, 160);
-pub const FAINT: Color = Color(255, 255, 255, 122);
-pub const HAIRLINE: Color = Color(255, 255, 255, 26);
-pub const ACCENT: Color = Color(139, 124, 246, 255);
-pub const DANGER: Color = Color(248, 113, 113, 255);
-pub const ADDED: Color = Color(52, 211, 153, 255);
+// Zeron's dark tokens (`theme.text`, `text_muted`, `text_faint`, `border`).
+pub const TEXT: Color = super::theme::TEXT;
+pub const BODY: Color = super::theme::TEXT;
+pub const MUTED: Color = super::theme::TEXT_MUTED;
+pub const HAIRLINE: Color = super::theme::BORDER;
+pub const ACCENT: Color = super::theme::ACCENT;
+pub const DANGER: Color = super::theme::DANGER;
 
 pub fn white(alpha: u8) -> Color {
     Color(255, 255, 255, alpha)
 }
 
-fn fade(color: Color, alpha: f32) -> Color {
+pub fn fade(color: Color, alpha: f32) -> Color {
     Color(
         color.0,
         color.1,
@@ -51,205 +45,7 @@ fn fade(color: Color, alpha: f32) -> Color {
     )
 }
 
-fn mix(from: Color, to: Color, t: f32) -> Color {
-    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
-    Color(
-        lerp(from.0, to.0),
-        lerp(from.1, to.1),
-        lerp(from.2, to.2),
-        lerp(from.3, to.3),
-    )
-}
-
-// Easing -------------------------------------------------------------------------
-
-pub fn ease_out_expo(x: f32) -> f32 {
-    let x = x.clamp(0., 1.);
-    if x >= 1. {
-        1.
-    } else {
-        1. - 2_f32.powf(-10. * x)
-    }
-}
-
-fn ease_out_quint(x: f32) -> f32 {
-    1. - (1. - x.clamp(0., 1.)).powi(5)
-}
-
-fn smoothstep(x: f32) -> f32 {
-    let x = x.clamp(0., 1.);
-    x * x * (3. - 2. * x)
-}
-
-fn window(p: f32, start: f32, end: f32) -> f32 {
-    ((p - start) / (end - start)).clamp(0., 1.)
-}
-
-/// A value easing from `from` to `target` starting at `at`.
-#[derive(Clone, Copy, PartialEq)]
-pub struct Tween {
-    pub from: f32,
-    pub target: f32,
-    pub at: f32,
-}
-
-impl Tween {
-    pub fn settled(value: f32) -> Self {
-        Self {
-            from: value,
-            target: value,
-            at: f32::NEG_INFINITY,
-        }
-    }
-    pub fn value(self, now: f32, seconds: f32) -> f32 {
-        self.from + (self.target - self.from) * ease_out_expo((now - self.at) / seconds)
-    }
-    pub fn toward(self, target: f32, now: f32, seconds: f32) -> Self {
-        Self {
-            from: self.value(now, seconds),
-            target,
-            at: now,
-        }
-    }
-}
-
-// Clock ------------------------------------------------------------------------
-
-/// Looping ambient motion (shimmer, pulses) looks the same at this rate.
-const AMBIENT_HZ: f64 = 30.;
-
-/// The page clock: full rate until `until`, `AMBIENT_HZ` while any ambient
-/// loop is registered, stopped otherwise. Views read it with `at`, which
-/// stops tracking once their animation has settled.
-#[derive(Clone)]
-pub struct Anim {
-    /// Full-rate time for fades and tweens.
-    pub clock: Signal<f32>,
-    /// Time for looping decoration (spinners, shimmer), stepped at
-    /// `AMBIENT_HZ` even while `clock` runs at the display rate, so text
-    /// streaming does not redraw every loader at 120 Hz.
-    pub ambient_clock: Signal<f32>,
-    origin: Instant,
-    until: Rc<Cell<f32>>,
-    ambient: Rc<Cell<u32>>,
-    running: Rc<Cell<bool>>,
-    tasks: Tasks,
-    frames: FrameClock,
-}
-
-impl Anim {
-    pub fn new(cx: &mut Context) -> Self {
-        Self {
-            clock: cx.state(0.),
-            ambient_clock: cx.state(0.),
-            origin: Instant::now(),
-            until: Rc::new(Cell::new(0.)),
-            ambient: Rc::new(Cell::new(0)),
-            running: Rc::new(Cell::new(false)),
-            tasks: cx.tasks(),
-            frames: cx.frames(),
-        }
-    }
-    pub fn now(&self) -> f32 {
-        self.origin.elapsed().as_secs_f32()
-    }
-    /// Keep full-rate frames coming for `seconds` more.
-    pub fn keep(&self, seconds: f32) {
-        self.until.set(self.until.get().max(self.now() + seconds));
-        self.run();
-    }
-    /// Register an ambient loop for as long as the guard lives.
-    pub fn ambient(&self) -> AmbientGuard {
-        self.ambient.set(self.ambient.get() + 1);
-        self.run();
-        AmbientGuard(self.ambient.clone())
-    }
-    fn run(&self) {
-        if self.running.replace(true) {
-            return;
-        }
-        let anim = self.clone();
-        self.tasks.spawn(async move {
-            loop {
-                let full = anim.now() < anim.until.get();
-                if !full && anim.ambient.get() == 0 {
-                    break;
-                }
-                let frame = if full {
-                    anim.frames.next().await
-                } else {
-                    anim.frames.next().max_rate(AMBIENT_HZ).await
-                };
-                // The frame's presentation time, not the wake-up time: steps
-                // land a whole refresh apart however late the task runs.
-                let at = frame
-                    .time
-                    .saturating_duration_since(anim.origin)
-                    .as_secs_f32();
-                let at = at.max(anim.clock.with_untracked(|c| *c));
-                anim.clock.set(at);
-                // A millisecond of slack keeps a 120 Hz display on every
-                // fourth refresh rather than drifting to every fifth.
-                let last = anim.ambient_clock.with_untracked(|c| *c);
-                if at - last >= 1. / AMBIENT_HZ as f32 - 0.001 {
-                    anim.ambient_clock.set(at);
-                }
-            }
-            anim.running.set(false);
-        });
-    }
-    /// The time, tracked until `end` and constant afterwards.
-    pub fn at(&self, end: f32) -> f32 {
-        let now = self.clock.with_untracked(|now| *now);
-        if now >= end { now } else { self.clock.get() }
-    }
-}
-
-pub struct AmbientGuard(Rc<Cell<u32>>);
-
-impl Drop for AmbientGuard {
-    fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
-    }
-}
-
-// Icons ---------------------------------------------------------------------
-
-const ICONS: [(&str, &[u8]); 12] = [
-    ("chevron", include_bytes!("icons/alt-arrow-down.svg")),
-    ("bot", include_bytes!("icons/bot.svg")),
-    ("thought", include_bytes!("icons/chat-round-line.svg")),
-    ("checklist", include_bytes!("icons/checklist.svg")),
-    ("document-add", include_bytes!("icons/document-add.svg")),
-    ("document", include_bytes!("icons/document.svg")),
-    ("folder", include_bytes!("icons/folder-with-files.svg")),
-    ("global", include_bytes!("icons/global.svg")),
-    ("search", include_bytes!("icons/magnifer.svg")),
-    ("pen", include_bytes!("icons/pen.svg")),
-    ("terminal", include_bytes!("icons/terminal.svg")),
-    ("widget", include_bytes!("icons/widget.svg")),
-];
-
-thread_local! {
-    static ICON_DATA: HashMap<&'static str, SvgData> = ICONS
-        .iter()
-        .map(|(name, bytes)| (*name, SvgData::new(*bytes).expect("bundled icon")))
-        .collect();
-}
-
-pub fn icon_data(name: &str) -> SvgData {
-    ICON_DATA.with(|icons| {
-        icons
-            .get(name)
-            .or_else(|| icons.get("widget"))
-            .cloned()
-            .expect("icon")
-    })
-}
-
-pub fn icon(name: &str, size: f32, color: Color) -> View {
-    svg(name, Arc::new(icon_data(name).tinted(color))).size(size, size)
-}
+pub use super::theme::{Anim, icon, icon_data};
 
 // Transcript -------------------------------------------------------------------
 
@@ -264,28 +60,120 @@ pub struct Ctx {
     pub toggles: Toggles,
 }
 
+impl Ctx {
+    #[allow(dead_code)]
+    pub fn new(anim: Anim, rpc: Option<Rpc>, transcript: model::Shared, tasks: Tasks) -> Self {
+        Self {
+            anim,
+            rpc,
+            transcript,
+            tasks,
+            toggles: Toggles::default(),
+        }
+    }
+}
+
 /// What the reader or the stream opened and closed, by part or entry, so a
 /// row scrolled out of the virtualized transcript comes back as it was left.
 #[derive(Clone, Default)]
 pub struct Toggles(Rc<std::cell::RefCell<HashMap<String, bool>>>);
 
 impl Toggles {
-    fn get(&self, key: &str) -> Option<bool> {
+    pub fn get(&self, key: &str) -> Option<bool> {
         self.0.borrow().get(key).copied()
     }
-    fn set(&self, key: &str, open: bool) {
+    pub fn set(&self, key: &str, open: bool) {
         self.0.borrow_mut().insert(key.to_owned(), open);
     }
 }
 
-/// Zeron's spacing: 16 before a new turn, 12 around tool groups, 8 else.
-fn gap(block: &Block, previous: Option<&Block>) -> f32 {
-    match (block, previous) {
-        (_, None) => 0.,
-        (Block::User(_), _) => 22.,
-        (Block::Group(_), _) | (_, Some(Block::Group(_))) => 10.,
-        _ => 12.,
+/// A row's kind, for its top gap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    User,
+    Text,
+    Group,
+    Error,
+}
+
+impl RowKind {
+    fn of(block: &Block) -> Self {
+        match block {
+            Block::User(_) => Self::User,
+            Block::Text(_) => Self::Text,
+            Block::Group(_) => Self::Group,
+            Block::Error(_) => Self::Error,
+        }
     }
+}
+
+/// Zeron's `top_gap_for`: nothing above the first row (the column pads it),
+/// 16 at a turn start (an entry's first row), 12 to or from a tool group,
+/// 8 else. Markdown blocks of one part sit 12 apart inside their part's view.
+pub fn top_gap(previous: Option<(RowKind, bool)>, this: RowKind) -> f32 {
+    match previous {
+        None => 0.,
+        Some((_, same_entry)) if !same_entry || this == RowKind::User => 16.,
+        Some((before, _)) if before == RowKind::Group || this == RowKind::Group => 12.,
+        Some(_) => 8.,
+    }
+}
+
+fn gap(transcript: &model::Transcript, block: &Block, previous: Option<&Block>) -> f32 {
+    let entry = |block: &Block| transcript.entry_of(block).map(|info| info.id);
+    let previous = previous.map(|before| {
+        let same = match (entry(before), entry(block)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+        (RowKind::of(before), same)
+    });
+    top_gap(previous, RowKind::of(block))
+}
+
+/// The hover metadata lane under a row: 8 + 2 × 12, reserved whether or not
+/// it shows, so revealing it never moves the list.
+pub const STRIP: f32 = 32.;
+
+/// User bubbles: 14 px text on 22 px lines, folded past five lines.
+const USER_LINE: f32 = 22.;
+const USER_LINES: usize = 5;
+const USER_CHARS: usize = 400;
+const USER_COLLAPSED_TEXT: f32 = USER_LINES as f32 * USER_LINE;
+/// The folded body with its "..." line: the fold's resize endpoint.
+const USER_COLLAPSED: f32 = USER_COLLAPSED_TEXT + USER_LINE;
+/// The expander: `mt 8` over one 22 px line.
+const USER_TOGGLE: f32 = 8. + USER_LINE;
+
+/// Zeron's fold decision: more than five source lines, or measured taller
+/// than five lines, or (not yet measured) longer than 400 characters.
+pub fn user_needs_collapse(text: &str, measured: f32) -> bool {
+    text.lines().count() > USER_LINES
+        || measured > USER_COLLAPSED_TEXT + 0.5
+        || (measured <= 0. && text.chars().count() > USER_CHARS)
+}
+
+/// Zeron's `user_resize_duration_ms`: travel-scaled, 220 ms up to 850 ms.
+pub fn user_resize_ms(delta: f32) -> f32 {
+    (220. + delta.max(0.) * 0.32).min(850.).round()
+}
+
+/// Zeron's `user_resize_spec`: ease-out, or ease-in-out past 500 px.
+pub fn user_resize_spec(delta: f32) -> Spec {
+    let curve = if delta > 500. {
+        super::theme::EASE_IN_OUT
+    } else {
+        super::theme::EASE_OUT
+    };
+    Spec(user_resize_ms(delta) / 1000., curve)
+}
+
+/// Error chip text: 12 px on gpui's default φ line height.
+const ERROR_LINE: f32 = 12. * 1.618;
+
+/// Zeron's `single_line`: whitespace runs collapse to one space.
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// A block's height in a `width` column before it is mounted: its text
@@ -324,15 +212,19 @@ pub fn estimate(
                 .get(entry)
                 .map(|t| t.with_untracked(String::clone))
                 .unwrap_or_default();
-            let long = text.len() > 420 || text.lines().count() > 6;
             let open = ctx.toggles.get(&format!("user:{entry}")).unwrap_or(false);
-            let body = lines(&text, 14., 22., width * 0.8 - 34.);
-            let body = if long && !open {
-                body.min(6. * 22.)
+            let body = lines(&text, 14., USER_LINE, width * 0.8 - 32.);
+            let body = if user_needs_collapse(&text, body) {
+                if open {
+                    body + USER_TOGGLE
+                } else {
+                    USER_COLLAPSED + USER_TOGGLE
+                }
             } else {
                 body
             };
-            body + 22. + if long { 24. } else { 0. }
+            // `py 10` around the body.
+            body + 20.
         }
         Block::Text(key) => transcript.parts.get(key).map_or(0., |part| {
             let parsed = part.text.with_untracked(|t| md::parse(t));
@@ -354,20 +246,20 @@ pub fn estimate(
                     md::Block::Item { depth, run, .. } => {
                         lines(&run.text, 14., 22., width - *depth as f32 * 26. - 26.)
                     }
-                    md::Block::Quote(run) => lines(&run.text, 14., 22., width - 24.) + 12.,
+                    md::Block::Quote(run) => lines(&run.text, 14., 22., width - 22.) + 12.,
                     md::Block::Code { run, .. } => {
-                        28. + run.text.lines().count().max(1) as f32 * 18. + 20.
+                        CODE_HEADER + code_lines(&run.text) as f32 * CODE_LINE + 2. * CODE_PAD_Y
                     }
-                    md::Block::Table { rows, .. } => (rows.len() + 1) as f32 * 34.,
-                    md::Block::Rule => 9.,
+                    md::Block::Table { rows, .. } => (rows.len() + 1) as f32 * 46.,
+                    md::Block::Rule => 1.,
                 };
             }
             height
         }),
         Block::Error(key) => transcript.parts.get(key).map_or(0., |part| {
-            part.text
-                .with_untracked(|text| lines(text, 13., 20., width - 60.))
-                + 22.
+            let message = part.text.with_untracked(|text| single_line(text));
+            // Wrapper `py 4`, frame `py 8`, the 20 px header and a 6 px gap.
+            8. + 16. + 20. + 6. + lines(&message, 12., ERROR_LINE, width - 20.)
         }),
         Block::Group(key) => {
             let members = transcript
@@ -375,134 +267,580 @@ pub fn estimate(
                 .get(key)
                 .map_or(0, |m| m.with_untracked(Vec::len));
             let open = ctx.toggles.get(&format!("group:{key}")).unwrap_or(false);
-            26. + if open { members as f32 * 30. } else { 0. }
+            // Header, then the chips' top pad and 32 px rail rows.
+            super::tools::HEADER_HEIGHT
+                + if open {
+                    super::tools::CHIPS_TOP_PAD + members as f32 * super::tools::ROW_HEIGHT
+                } else {
+                    0.
+                }
         }
     };
-    gap(block, previous) + body
+    let strip = if transcript.strips.with_untracked(|s| s.contains(block)) {
+        STRIP
+    } else {
+        0.
+    };
+    gap(&transcript, block, previous) + body + strip
 }
 
-/// One transcript row, with Zeron's entrance: 500 ms expo, rising 4 px.
+/// One transcript row: its top gap (padding, so the gap is part of the
+/// entry's hover area, as in Zeron), its content and, under an entry's
+/// last row, the reserved metadata strip. Rows appear instantly: Zeron has
+/// no entrance motion for messages; only the streaming veil fades text.
 pub fn block(cx: &mut Context, ctx: &Ctx, block: &Block, previous: Option<Block>) -> View {
-    let born = ctx.transcript.borrow().born(block);
-    let gap = gap(block, previous.as_ref());
+    let (gap, entry) = {
+        let transcript = ctx.transcript.borrow();
+        (
+            gap(&transcript, block, previous.as_ref()),
+            transcript.entry_of(block).map(|info| info.id),
+        )
+    };
     let view = match block {
         Block::User(entry) => user_bubble(cx, ctx, entry),
         Block::Text(key) => match ctx.transcript.borrow().parts.get(key).cloned() {
-            Some(part) => markdown(cx, ctx, part),
+            Some(part) => markdown(cx, ctx, key, part),
             None => div(),
         },
-        Block::Error(key) => error_card(ctx, key),
+        Block::Error(key) => error_chip(cx, ctx, key),
         Block::Group(key) => match ctx.transcript.borrow().groups.get(key).cloned() {
-            Some(members) => tool_group(cx, ctx, key, members),
+            Some(members) => super::tools::tool_group(cx, ctx, key, members),
             None => div(),
         },
     };
-    let view = view.mt(gap);
-    match born {
-        // Remounted after its entrance (scrolled back into view): no motion.
-        Some(born) if ctx.anim.now() < born + 0.5 => {
-            ctx.anim.keep(0.6);
-            let anim = ctx.anim.clone();
-            view.reactive_style(move || {
-                let p = ease_out_expo((anim.at(born + 0.5) - born) / 0.5);
-                Styles::new().opacity(p).translate(0., 6. * (1. - p))
-            })
-        }
-        _ => view,
+    let row = column()
+        .w_full()
+        .pt(gap)
+        .child(view)
+        .child(strip(ctx, block));
+    match entry {
+        Some(entry) => track_entry_hover(ctx, block.clone(), entry, row),
+        None => row,
     }
 }
 
-fn user_bubble(cx: &mut Context, ctx: &Ctx, entry: &str) -> View {
-    let text_ = ctx.transcript.borrow().user_text.get(entry).cloned();
-    let long = text_
-        .as_ref()
-        .is_some_and(|t| t.with_untracked(|t| t.len() > 420 || t.lines().count() > 6));
-    let memory = format!("user:{entry}");
-    let expanded = cx.state(ctx.toggles.get(&memory).unwrap_or(false));
-    let body = {
-        let expanded = expanded.clone();
-        text_signal(move || text_.as_ref().map(Signal::get).unwrap_or_default())
-            .w_full()
-            .text_wrap(true)
-            .text_size(14.)
-            .line_height(22.)
-            .text_color(TEXT)
-            .reactive_style(move || {
-                if long && !expanded.get() {
-                    Styles::new()
-                        .line_clamp(6)
-                        .text_overflow(zgui::text_layout::TextOverflow::Ellipsis)
-                } else {
-                    Styles::new().line_clamp(0)
+/// Reveal the entry's strips while the pointer is over any of its rows.
+/// Pointer enter and leave bubble from the node under the pointer, so moving
+/// between two children of a row is a leave then an enter: the clear waits a
+/// tick and is dropped if the pointer is still inside. Only the row that
+/// owns the reveal clears it.
+fn track_entry_hover(ctx: &Ctx, block: Block, entry: String, row: View) -> View {
+    let hovered = ctx.transcript.borrow().hovered.clone();
+    let tasks = ctx.tasks.clone();
+    let inside = Rc::new(std::cell::Cell::new(false));
+    row.on_event(move |event| match event.event {
+        InputEvent::PointerEnter => {
+            inside.set(true);
+            let next = Some((block.clone(), entry.clone()));
+            if hovered.with_untracked(|h| *h != next) {
+                hovered.set(next);
+            }
+        }
+        InputEvent::PointerLeave | InputEvent::PointerCancel => {
+            inside.set(false);
+            let (inside, hovered, block) = (inside.clone(), hovered.clone(), block.clone());
+            // Spawned tasks run on the next executor tick, after this
+            // event's enter (if any) has been routed.
+            tasks.spawn(async move {
+                if !inside.get()
+                    && hovered.with_untracked(|h| h.as_ref().is_some_and(|(row, _)| *row == block))
+                {
+                    hovered.set(None);
                 }
-            })
+            });
+        }
+        _ => {}
+    })
+}
+
+/// The reserved 32 px lane under a user bubble or a settled entry's last
+/// row; its timestamp and copy button mount while the entry is hovered,
+/// fading in over `FADE_QUICK`, and vanish at once on leave.
+fn strip(ctx: &Ctx, block: &Block) -> View {
+    let strips = ctx.transcript.borrow().strips.clone();
+    let (ctx, block) = (ctx.clone(), block.clone());
+    let key = block.clone();
+    switch(
+        move || strips.with(|s| s.contains(&key)),
+        move |shown, _| {
+            if !shown {
+                return div();
+            }
+            let Some(info) = ctx.transcript.borrow().entry_of(&block) else {
+                return div();
+            };
+            let user = info.role == "user";
+            let hovered = ctx.transcript.borrow().hovered.clone();
+            let ctx = ctx.clone();
+            let entry = info.id.clone();
+            row()
+                .w_full()
+                .h(STRIP)
+                .pt(8.)
+                .items_center()
+                .when(user, |r| r.justify_end())
+                .child(switch(
+                    move || hovered.with(|h| h.as_ref().is_some_and(|(_, e)| *e == entry)),
+                    move |on, cx| {
+                        if on { metadata(cx, &ctx, &info) } else { div() }
+                    },
+                ))
+        },
+    )
+    .w_full()
+}
+
+fn metadata(cx: &mut Context, ctx: &Ctx, info: &model::EntryInfo) -> View {
+    let anim = ctx.anim.clone();
+    let born = anim.now();
+    anim.keep(FADE_QUICK.0 + 0.05);
+    let stamp = info
+        .created_ms
+        .map(|ms| format_timestamp(ms, local_offset(ms)))
+        .unwrap_or_default();
+    let has_copy = ctx.transcript.borrow().copy_text(&info.id).is_some();
+    let copy = has_copy.then(|| {
+        let copied = cx.state(false);
+        let (transcript, tasks, entry) =
+            (ctx.transcript.clone(), ctx.tasks.clone(), info.id.clone());
+        let on_copy = {
+            let copied = copied.clone();
+            move || {
+                let text = transcript.borrow().copy_text(&entry);
+                if let Some(text) = text
+                    && let Ok(mut clipboard) = arboard::Clipboard::new()
+                    && clipboard.set_text(text).is_ok()
+                {
+                    copied.set(true);
+                    let copied = copied.clone();
+                    tasks.spawn(async move {
+                        zgui::timer::sleep(std::time::Duration::from_millis(1200)).await;
+                        copied.set(false);
+                    });
+                }
+            }
+        };
+        faded_button(
+            cx,
+            &ctx.anim,
+            row()
+                .size(24., 24.)
+                .rounded(6.)
+                .items_center()
+                .justify_center()
+                .cursor(Cursor::Pointer)
+                .on_click(on_copy)
+                .child(icon_switch(14., MUTED, move || {
+                    if copied.get() { "check" } else { "copy" }
+                })),
+            || (Color(0, 0, 0, 0), ink(0.08)),
+        )
+    });
+    row()
+        .gap(8.)
+        .items_center()
+        .reactive_style(move || {
+            let p = FADE_QUICK.at(anim.at(born + FADE_QUICK.0) - born);
+            Styles::new().opacity(p)
+        })
+        .child(text(stamp).text_size(12.).text_color(alpha(MUTED, 0.55)))
+        .children(copy)
+}
+
+/// A monochrome icon whose glyph follows `name`.
+fn icon_switch(size: f32, color: Color, name: impl Fn() -> &'static str + 'static) -> View {
+    svg_signal("icon", move || Arc::new(icon_data(name()).tinted(color))).size(size, size)
+}
+
+/// A quiet icon button: its background blends `base` → `over` over 150 ms
+/// on hover (Zeron's `hover_blend`).
+fn faded_button(
+    cx: &mut Context,
+    anim: &Anim,
+    view: View,
+    colors: impl Fn() -> (Color, Color) + 'static,
+) -> View {
+    let hover = Hover::new(cx, anim);
+    let blend = hover.clone();
+    hover.track(view.reactive_style(move || {
+        let (base, over) = colors();
+        Styles::new().bg(super::theme::mix(base, over, blend.get()))
+    }))
+}
+
+// Timestamps ---------------------------------------------------------------------
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// (year, month 1-12, day) from days since 1970-01-01 (Howard Hinnant).
+fn civil_from_days(days: i64) -> (i64, usize, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month as usize, day)
+}
+
+/// Zeron's `format_timestamp`: `%b %-d, %-I:%M %p` ("Jul 1, 3:45 PM") at a
+/// UTC offset of `offset` seconds.
+pub fn format_timestamp(ms: i64, offset: i64) -> String {
+    let seconds = ms.div_euclid(1000) + offset;
+    let (_, month, day) = civil_from_days(seconds.div_euclid(86_400));
+    let of_day = seconds.rem_euclid(86_400);
+    let (hour, minute) = (of_day / 3600, of_day % 3600 / 60);
+    let (hour12, meridiem) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
     };
-    let more = {
-        let (label, toggle) = (expanded.clone(), expanded.clone());
-        row()
-            .gap(4.)
-            .items_center()
-            .text_size(12.5)
-            .text_color(MUTED)
-            .cursor(Cursor::Pointer)
-            .hover(|s| s.text_color(TEXT))
-            .on_click({
-                let toggles = ctx.toggles.clone();
-                move || {
-                    toggle.update(|e| *e = !*e);
-                    toggles.set(&memory, toggle.with_untracked(|open| *open));
-                }
-            })
-            .child(text_signal(move || {
-                if label.get() {
-                    "Show less".into()
-                } else {
-                    "Show more".into()
-                }
-            }))
-            .when(!long, |v| v.hidden())
-    };
-    column().w_full().items_end().child(
-        column()
-            .max_w_percent(80.)
-            .rounded(18.)
-            .px(16.)
-            .py(10.)
-            .gap(6.)
-            .bg(white(18))
-            .border(1.)
-            .border_color(white(14))
-            .child(body)
-            .child(more),
+    format!(
+        "{} {day}, {hour12}:{minute:02} {meridiem}",
+        MONTHS[month - 1]
     )
 }
 
-fn error_card(ctx: &Ctx, key: &str) -> View {
+/// The local zone's UTC offset (seconds) at `ms`, from `localtime_r`.
+#[cfg(all(unix, target_pointer_width = "64"))]
+fn local_offset(ms: i64) -> i64 {
+    use std::ffi::{c_char, c_int, c_long};
+    #[repr(C)]
+    struct Tm {
+        sec: c_int,
+        min: c_int,
+        hour: c_int,
+        mday: c_int,
+        mon: c_int,
+        year: c_int,
+        wday: c_int,
+        yday: c_int,
+        isdst: c_int,
+        gmtoff: c_long,
+        zone: *const c_char,
+    }
+    unsafe extern "C" {
+        fn localtime_r(time: *const i64, out: *mut Tm) -> *mut Tm;
+    }
+    let time = ms.div_euclid(1000);
+    let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+    // SAFETY: `localtime_r` writes a `struct tm` (whose 64-bit layout on
+    // macOS and glibc matches `Tm`) into the buffer and returns it, or null.
+    unsafe {
+        if localtime_r(&time, tm.as_mut_ptr()).is_null() {
+            0
+        } else {
+            tm.assume_init().gmtoff
+        }
+    }
+}
+
+#[cfg(not(all(unix, target_pointer_width = "64")))]
+fn local_offset(_ms: i64) -> i64 {
+    0
+}
+
+// User bubble ----------------------------------------------------------------------
+
+/// A fold resize in flight: the body's height (including the "..." line)
+/// eases `from` → `to` starting at `at`.
+#[derive(Clone, Copy, PartialEq)]
+struct Fold {
+    from: f32,
+    to: f32,
+    at: f32,
+    spec: Spec,
+}
+
+impl Fold {
+    fn end(self) -> f32 {
+        self.at + self.spec.0
+    }
+    fn value(self, now: f32) -> f32 {
+        self.from + (self.to - self.from) * self.spec.at(now - self.at)
+    }
+}
+
+/// Zeron's user bubble: `wash(.08)`, radius 16, `px 16 py 10`, right-aligned
+/// and capped at 80% of the column. Past five lines the text is clipped to
+/// five line boxes over a "..." line, with a "Show more" link; toggling eases
+/// the clip's height over a travel-scaled duration.
+fn user_bubble(cx: &mut Context, ctx: &Ctx, entry: &str) -> View {
+    let text_ = ctx
+        .transcript
+        .borrow()
+        .user_text
+        .get(entry)
+        .cloned()
+        .unwrap_or_else(|| cx.state(String::new()));
+    let memory = format!("user:{entry}");
+    let expanded = cx.state(ctx.toggles.get(&memory).unwrap_or(false));
+    // The full text's laid-out height, from a probe behind the clip.
+    let measured = cx.state(0_f32);
+    let fold = cx.state(None::<Fold>);
+    let anim = ctx.anim.clone();
+    let collapsible = {
+        let (text_, measured) = (text_.clone(), measured.clone());
+        move || text_.with(|t| user_needs_collapse(t, measured.get()))
+    };
+    let probe = {
+        let measured = measured.clone();
+        canvas(move |(_, height)| {
+            if measured.with_untracked(|m| (m - height).abs() > 0.5) {
+                measured.set(height);
+            }
+            zgui::canvas::Canvas::new()
+        })
+        .absolute()
+        .left(0.)
+        .top(0.)
+        .right(0.)
+        .bottom(0.)
+    };
+    let body = {
+        let text_ = text_.clone();
+        column()
+            .w_full()
+            .shrink_0()
+            .child(
+                text_signal(move || text_.get())
+                    .w_full()
+                    .text_wrap(true)
+                    .text_size(14.)
+                    .line_height(USER_LINE)
+                    .text_color(TEXT),
+            )
+            .child(probe)
+    };
+    // The full text stays laid out behind the clip; only the clip's height
+    // changes, so wrapping never shifts.
+    let clip = {
+        let (expanded, fold, anim, collapsible) = (
+            expanded.clone(),
+            fold.clone(),
+            anim.clone(),
+            collapsible.clone(),
+        );
+        column().w_full().child(body).reactive_style(move || {
+            let open = expanded.get();
+            let foldable = collapsible();
+            if let Some(f) = fold.get()
+                && foldable
+            {
+                let now = anim.at(f.end());
+                if now < f.end() {
+                    let ellipsis = if open { 0. } else { USER_LINE };
+                    return Styles::new()
+                        .h((f.value(now) - ellipsis).max(0.))
+                        .overflow_hidden();
+                }
+            }
+            if foldable && !open {
+                Styles::new().h(USER_COLLAPSED_TEXT).overflow_hidden()
+            } else {
+                Styles::new()
+            }
+        })
+    };
+    let ellipsis = {
+        let (expanded, collapsible) = (expanded.clone(), collapsible.clone());
+        div()
+            .h(USER_LINE)
+            .text_size(14.)
+            .line_height(USER_LINE)
+            .text_color(TEXT)
+            .child(text("..."))
+            .reactive_style(move || {
+                if collapsible() && !expanded.get() {
+                    Styles::new()
+                } else {
+                    Styles::new().hidden()
+                }
+            })
+    };
+    let expander = {
+        let hovered = cx.state(false);
+        let (label, glyph, tint) = (expanded.clone(), expanded.clone(), hovered.clone());
+        let on_toggle = {
+            let (expanded, measured, fold, anim, toggles) = (
+                expanded.clone(),
+                measured.clone(),
+                fold.clone(),
+                anim.clone(),
+                ctx.toggles.clone(),
+            );
+            move || {
+                let now = anim.now();
+                let full = measured.with_untracked(|m| *m).max(USER_COLLAPSED);
+                let open = expanded.with_untracked(|e| *e);
+                // From wherever the body is now, so a reversal doesn't jump.
+                let from = match fold.with_untracked(|f| *f) {
+                    Some(f) if now < f.end() => f.value(now),
+                    _ if open => full,
+                    _ => USER_COLLAPSED,
+                };
+                let to = if open { USER_COLLAPSED } else { full };
+                let spec = user_resize_spec(full - USER_COLLAPSED);
+                fold.set(Some(Fold {
+                    from,
+                    to,
+                    at: now,
+                    spec,
+                }));
+                expanded.set(!open);
+                toggles.set(&memory, !open);
+                anim.keep(spec.0 + 0.05);
+            }
+        };
+        let collapsible = collapsible.clone();
+        row()
+            .mt(8.)
+            .items_start()
+            .reactive_style(move || {
+                if collapsible() {
+                    Styles::new()
+                } else {
+                    Styles::new().hidden()
+                }
+            })
+            .child(
+                row()
+                    .gap(5.)
+                    .items_center()
+                    .text_size(14.)
+                    .line_height(USER_LINE)
+                    .cursor(Cursor::Pointer)
+                    .on_click(on_toggle)
+                    .on_event(move |event| match event.event {
+                        InputEvent::PointerEnter => {
+                            hovered.set(true);
+                        }
+                        InputEvent::PointerLeave | InputEvent::PointerCancel => {
+                            hovered.set(false);
+                        }
+                        _ => {}
+                    })
+                    .reactive_style({
+                        let tint = tint.clone();
+                        move || Styles::new().text_color(if tint.get() { TEXT } else { MUTED })
+                    })
+                    .child(text_signal(move || {
+                        if label.get() {
+                            "Show less"
+                        } else {
+                            "Show more"
+                        }
+                        .into()
+                    }))
+                    .child(
+                        svg_signal("expander", move || {
+                            let name = if glyph.get() {
+                                "alt-arrow-up"
+                            } else {
+                                "alt-arrow-down"
+                            };
+                            Arc::new(icon_data(name).tinted(if tint.get() { TEXT } else { MUTED }))
+                        })
+                        .size(12., 12.),
+                    ),
+            )
+    };
+    // `min_w 0` lets a long prompt wrap inside the 80% cap.
+    row().w_full().justify_end().child(
+        column()
+            .min_w(0.)
+            .max_w_percent(80.)
+            .rounded(16.)
+            .px(16.)
+            .py(10.)
+            .bg(wash(0.08))
+            .text_size(14.)
+            .line_height(USER_LINE)
+            .text_color(TEXT)
+            .child(clip)
+            .child(ellipsis)
+            .child(expander),
+    )
+}
+
+// Error chip -------------------------------------------------------------------------
+
+/// Zeron's transcript `ErrorChip` (`notice_chip` with the tile): a red-washed
+/// card with a danger tile, "Error", a copy button and the wrapped message.
+fn error_chip(cx: &mut Context, ctx: &Ctx, key: &str) -> View {
     let message = ctx
         .transcript
         .borrow()
         .parts
         .get(key)
-        .map(|p| p.text.clone());
-    row()
+        .map(|p| p.text.clone())
+        .unwrap_or_else(|| cx.state(String::new()));
+    let label = alpha(DANGER_MUTED, 0.8);
+    let copy = {
+        let message = message.clone();
+        move || {
+            let text = message.with_untracked(|m| single_line(m));
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                let _ = clipboard.set_text(text);
+            }
+        }
+    };
+    let header = row()
         .w_full()
-        .px(14.)
-        .py(10.)
-        .gap(10.)
-        .rounded(12.)
-        .bg(Color(255, 112, 114, 22))
-        .border(1.)
-        .border_color(Color(255, 112, 114, 64))
-        .child(text("!").font_weight(700).text_size(13.).text_color(DANGER))
+        .gap(8.)
+        .items_center()
         .child(
-            text_signal(move || message.as_ref().map(Signal::get).unwrap_or_default())
-                .grow()
-                .min_w(0.)
-                .text_wrap(true)
-                .text_size(13.)
-                .line_height(20.)
-                .text_color(fade(DANGER, 0.95)),
+            row()
+                .size(20., 20.)
+                .shrink_0()
+                .rounded(6.)
+                .bg(alpha(DANGER, 0.12))
+                .items_center()
+                .justify_center()
+                .child(icon("danger-triangle", 12., label)),
         )
+        .child(text("Error").font_weight(500).text_color(label))
+        .child(div().grow())
+        .child(
+            row()
+                .size(20., 20.)
+                .shrink_0()
+                .rounded(6.)
+                .items_center()
+                .justify_center()
+                .cursor(Cursor::Pointer)
+                .hover(|s| s.bg(alpha(DANGER, 0.12)))
+                .on_click(copy)
+                .child(icon("copy", 12., label)),
+        );
+    column().w_full().py(4.).child(
+        column()
+            .w_full()
+            .gap(6.)
+            .rounded(10.)
+            .border(1.)
+            .border_color(alpha(DANGER, 0.16))
+            .bg(alpha(DANGER, 0.05))
+            .px(10.)
+            .py(8.)
+            .text_size(12.)
+            .line_height(ERROR_LINE)
+            .overflow_hidden()
+            .child(header)
+            .child(
+                text_signal(move || message.with(|m| single_line(m)))
+                    .w_full()
+                    .min_w(0.)
+                    .text_wrap(true)
+                    .text_color(alpha(TEXT, 0.8)),
+            ),
+    )
 }
 
 // Markdown ---------------------------------------------------------------------
@@ -561,15 +899,18 @@ fn styled_span(text: String, style: Style, base: Color, alpha: f32) -> TextSpan 
             .text_color(fade(TEXT, alpha))
             .font_weight(600)
             .italic(true),
-        Style::Strike => span
-            .text_color(fade(MUTED, alpha))
-            .strikethrough(zgui::rich_text::Decoration::new(1.)),
-        // Accent on a 22% accent wash, as Zeron paints inline code.
+        // The text keeps its colour under a muted 1 px line.
+        Style::Strike => span.text_color(fade(base, alpha)).strikethrough({
+            let mut line = zgui::rich_text::Decoration::new(1.);
+            line.color = Some(fade(MUTED, alpha));
+            line
+        }),
+        // Geist Mono at the surrounding size, accent on the accent wash. The
+        // wash is not veiled (Zeron paints it under the text).
         Style::Code => span
-            .font_family(FontFamily::Monospace)
-            .text_size(12.5)
-            .text_color(fade(Color(171, 161, 249, 255), alpha))
-            .background(fade(Color(139, 124, 246, 56), alpha)),
+            .font_family(super::theme::MONO)
+            .text_color(fade(ACCENT, alpha))
+            .background(super::theme::CODE_WASH),
         // Links keep the text colour over a muted underline.
         Style::Link => span.text_color(fade(TEXT, alpha)).underline({
             let mut line = zgui::rich_text::Decoration::new(1.);
@@ -613,7 +954,7 @@ fn newest(chunks: &[Chunk]) -> f32 {
         .fold(f32::NEG_INFINITY, f32::max)
 }
 
-fn markdown(cx: &mut Context, ctx: &Ctx, part: Rc<model::Part>) -> View {
+fn markdown(cx: &mut Context, ctx: &Ctx, key: &str, part: Rc<model::Part>) -> View {
     let blocks = cx.state(Vec::<md::Block>::new());
     {
         let (blocks, text_) = (blocks.clone(), part.text.clone());
@@ -626,7 +967,7 @@ fn markdown(cx: &mut Context, ctx: &Ctx, part: Rc<model::Part>) -> View {
     // A block that changes kind while streaming (a line that turns out to
     // start a table) gets a fresh view: key by index and kind.
     let keys = blocks.clone();
-    let (ctx, part) = (ctx.clone(), part.clone());
+    let (ctx, part, key) = (ctx.clone(), part.clone(), key.to_owned());
     keyed(
         move || {
             keys.with(|b| {
@@ -643,7 +984,7 @@ fn markdown(cx: &mut Context, ctx: &Ctx, part: Rc<model::Part>) -> View {
                 Some(1) if this == 1 => 4.,
                 Some(_) => 12.,
             };
-            md_block(cx, &ctx, &part, &blocks, index).mt(gap)
+            md_block(cx, &ctx, &key, &part, &blocks, index).mt(gap)
         },
     )
     .w_full()
@@ -664,6 +1005,7 @@ fn kind(block: &md::Block) -> u8 {
 fn md_block(
     cx: &mut Context,
     ctx: &Ctx,
+    key: &str,
     part: &Rc<model::Part>,
     blocks: &Signal<Vec<md::Block>>,
     index: usize,
@@ -684,9 +1026,13 @@ fn md_block(
         }
     };
     match this() {
-        Some(md::Block::Code { lang, .. }) => code_block(cx, ctx, lang, this, chunks),
+        Some(md::Block::Code { lang, .. }) => {
+            let fit = format!("fit:{key}:{index}");
+            code_block(cx, ctx, fit, lang, this, chunks)
+        }
         Some(md::Block::Table { .. }) => table(cx, this, spans_of),
-        Some(md::Block::Rule) => div().w_full().h(1.).my(4.).bg(HAIRLINE),
+        // A bare 1 px rule: the 12 px block gaps space it.
+        Some(md::Block::Rule) => div().w_full().h(1.).bg(HAIRLINE),
         Some(md::Block::Heading(level, _)) => rich_text_signal(move || match this() {
             Some(md::Block::Heading(_, run)) => spans_of(&run, TEXT),
             _ => Vec::new(),
@@ -704,18 +1050,29 @@ fn md_block(
             2 => 24.,
             _ => 22.,
         })
-        .font_weight(600)
-        .letter_spacing(if level == 1 { -0.2 } else { 0. }),
-        Some(md::Block::Item {
-            depth,
-            marker,
-            task,
-            ..
-        }) => {
+        .font_weight(600),
+        Some(md::Block::Item { depth, marker, .. }) => {
+            // The transcript has no task checkboxes: a task item keeps the
+            // accent disc and reads its "[ ] " / "[x] " literally.
             let body = rich_text_signal({
-                let spans_of = spans_of.clone();
+                let (spans_of, chunks, anim) = (spans_of.clone(), chunks.clone(), anim.clone());
                 move || match this() {
-                    Some(md::Block::Item { run, .. }) => spans_of(&run, BODY),
+                    Some(md::Block::Item { run, task, .. }) => {
+                        let mut spans = Vec::new();
+                        if let Some(done) = task {
+                            let start = run.start.saturating_sub(4);
+                            let alpha = chunks.with(|c| {
+                                let now = veil_now(&anim, c, start..run.start);
+                                veil_alpha(c, start, now)
+                            });
+                            spans.push(
+                                text_span(if done { "[x] " } else { "[ ] " })
+                                    .text_color(fade(BODY, alpha)),
+                            );
+                        }
+                        spans.extend(spans_of(&run, BODY));
+                        spans
+                    }
                     _ => Vec::new(),
                 }
             })
@@ -724,31 +1081,16 @@ fn md_block(
             .text_wrap(true)
             .text_size(14.)
             .line_height(22.);
-            // A 5 px accent disc, an accent "N." or a checkbox, in an
-            // 18 px column centred on the first line.
-            let marker_view = match task {
-                Some(done) => row()
-                    .size(15., 15.)
-                    .mt(3.5)
-                    .rounded(3.)
-                    .items_center()
-                    .justify_center()
-                    .border(1.)
-                    .border_color(if done { ACCENT } else { white(56) })
-                    .bg(if done { ACCENT } else { white(0) })
-                    .child(
-                        text(if done { "✓" } else { "" })
-                            .text_size(10.)
-                            .font_weight(700)
-                            .text_color(Color(6, 6, 6, 255)),
-                    ),
-                None if marker == "•" => row()
+            // A 5 px accent disc or an accent "N.", in an 18 px column
+            // centred on the first line.
+            let marker_view = match marker.as_str() {
+                "•" | "" => row()
                     .w(18.)
                     .h(22.)
                     .shrink_0()
                     .items_center()
                     .child(div().size(5., 5.).ml(1.).rounded(2.5).bg(ACCENT)),
-                None => text(marker)
+                _ => text(marker)
                     .min_w(18.)
                     .shrink_0()
                     .text_size(14.)
@@ -784,7 +1126,7 @@ fn md_block(
             .py(6.)
             .child(
                 rich_text_signal(move || match this() {
-                    Some(md::Block::Quote(run)) => spans_of(&run, MUTED),
+                    Some(md::Block::Quote(run)) => spans_of(&run, TEXT),
                     _ => Vec::new(),
                 })
                 .w_full()
@@ -817,122 +1159,210 @@ fn token_color(token: Token) -> Color {
     }
 }
 
+/// Code block metrics (Zeron's `CODE_HEADER_HEIGHT`, `CODE_PADDING_*` and
+/// 12.5 px Geist Mono on 18 px lines).
+const CODE_HEADER: f32 = 28.;
+const CODE_LINE: f32 = 18.;
+const CODE_PAD_Y: f32 = 10.;
+
+/// The body's lines: a trailing newline (a fence still streaming) is not a
+/// line of its own.
+fn code_lines(code: &str) -> usize {
+    code.trim_end_matches('\n').lines().count().max(1)
+}
+
+/// Zeron's code block: a 10 px rounded frame on `ink(.035)` with a 28 px
+/// header (language; fit toggle and copy button) over the highlighted body,
+/// which scrolls sideways unless fit is on.
 fn code_block(
     cx: &mut Context,
     ctx: &Ctx,
+    fit_key: String,
     lang: String,
     this: impl Fn() -> Option<md::Block> + Clone + 'static,
     chunks: Signal<Vec<Chunk>>,
 ) -> View {
-    const LINE: f32 = 18.;
     let copied = cx.state(false);
+    let fit = cx.state(ctx.toggles.get(&fit_key).unwrap_or(false));
     let anim = ctx.anim.clone();
+    // The highlighted source, wrapped or not.
     let code = {
         let (this, lang) = (this.clone(), lang.clone());
-        rich_text_signal(move || {
-            let Some(md::Block::Code { run, .. }) = this() else {
-                return Vec::new();
-            };
-            let now = chunks.with(|c| veil_now(&anim, c, run.start..run.start + run.text.len()));
-            let mut spans = Vec::new();
-            chunks.with(|chunks| {
-                for (range, token) in md::highlight(&run.text, &lang) {
-                    let piece = Piece {
-                        text: run.text[range.clone()].to_owned(),
-                        start: run.start + range.start,
-                        style: Style::Plain,
-                    };
-                    veiled(&piece, chunks, now, |text, alpha| {
-                        spans.push(text_span(text).text_color(fade(token_color(token), alpha)));
-                    });
-                }
-            });
-            spans
+        Rc::new(move |wrap: bool| {
+            let (this, lang, chunks, anim) =
+                (this.clone(), lang.clone(), chunks.clone(), anim.clone());
+            rich_text_signal(move || {
+                let Some(md::Block::Code { run, .. }) = this() else {
+                    return Vec::new();
+                };
+                let source = run.text.trim_end_matches('\n');
+                let now =
+                    chunks.with(|c| veil_now(&anim, c, run.start..run.start + run.text.len()));
+                let mut spans = Vec::new();
+                chunks.with(|chunks| {
+                    for (range, token) in md::highlight(source, &lang) {
+                        let piece = Piece {
+                            text: source[range.clone()].to_owned(),
+                            start: run.start + range.start,
+                            style: Style::Plain,
+                        };
+                        veiled(&piece, chunks, now, |text, alpha| {
+                            spans.push(text_span(text).text_color(fade(token_color(token), alpha)));
+                        });
+                    }
+                });
+                spans
+            })
+            .text_wrap(wrap)
+            .font_family(super::theme::MONO)
+            .text_size(12.5)
+            .line_height(CODE_LINE)
         })
-        .text_wrap(false)
-        .font_family(FontFamily::Monospace)
-        .text_size(12.5)
-        .line_height(LINE)
     };
-    let offset = cx.state(0_f32);
-    let height_of = this.clone();
     let copy = {
         let (this, copied) = (this.clone(), copied.clone());
         let tasks = ctx.tasks.clone();
         move || {
             if let Some(md::Block::Code { run, .. }) = this()
                 && let Ok(mut clipboard) = arboard::Clipboard::new()
-                && clipboard.set_text(run.text).is_ok()
+                && clipboard
+                    .set_text(run.text.trim_end_matches('\n').to_owned())
+                    .is_ok()
             {
                 copied.set(true);
                 let copied = copied.clone();
                 tasks.spawn(async move {
-                    zgui::timer::sleep(std::time::Duration::from_millis(1400)).await;
+                    zgui::timer::sleep(std::time::Duration::from_millis(1200)).await;
                     copied.set(false);
                 });
             }
         }
     };
-    column()
+    let fit_toggle = {
+        let (state, shade, toggles) = (fit.clone(), fit.clone(), ctx.toggles.clone());
+        faded_button(
+            cx,
+            &ctx.anim,
+            row()
+                .size(22., 22.)
+                .rounded(6.)
+                .items_center()
+                .justify_center()
+                .cursor(Cursor::Pointer)
+                .on_click(move || {
+                    let on = !state.with_untracked(|f| *f);
+                    state.set(on);
+                    toggles.set(&fit_key, on);
+                })
+                .child(icon("wrap-text", 13., MUTED)),
+            move || {
+                if shade.get() {
+                    (ink(0.09), ink(0.13))
+                } else {
+                    (Color(0, 0, 0, 0), ink(0.08))
+                }
+            },
+        )
+    };
+    let copy_button = {
+        let (glyph, label) = (copied.clone(), copied.clone());
+        faded_button(
+            cx,
+            &ctx.anim,
+            row()
+                .h(22.)
+                .px(6.)
+                .gap(4.)
+                .rounded(5.)
+                .items_center()
+                .cursor(Cursor::Pointer)
+                .text_size(10.5)
+                .text_color(MUTED)
+                .on_click(copy)
+                .child(icon_switch(12., MUTED, move || {
+                    if glyph.get() { "check" } else { "copy" }
+                }))
+                // Only the copied state carries a label.
+                .child(text("Copied").reactive_style(move || {
+                    if label.get() {
+                        Styles::new()
+                    } else {
+                        Styles::new().hidden()
+                    }
+                })),
+            || (Color(0, 0, 0, 0), ink(0.08)),
+        )
+    };
+    let label = lang
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let header = row()
         .w_full()
-        .rounded(10.)
-        .bg(white(9))
-        .border(1.)
-        .border_color(white(26))
-        .overflow_hidden()
+        .h(CODE_HEADER)
+        .shrink_0()
+        .pl(12.)
+        .pr(5.)
+        .items_center()
+        .justify_between()
+        .bg(ink(0.02))
+        .border_edges(zgui::scene::Insets {
+            top: 0.,
+            right: 0.,
+            bottom: 1.,
+            left: 0.,
+        })
+        .border_color(HAIRLINE)
+        .child(text(label).min_w(0.).text_size(11.).text_color(MUTED))
         .child(
             row()
-                .w_full()
-                .h(28.)
-                .pl(12.)
-                .pr(5.)
+                .shrink_0()
+                .gap(2.)
                 .items_center()
-                .justify_between()
-                .bg(white(5))
-                .border_edges(zgui::scene::Insets {
-                    top: 0.,
-                    right: 0.,
-                    bottom: 1.,
-                    left: 0.,
-                })
-                .border_color(white(26))
-                .child(text(lang).text_size(11.).text_color(MUTED))
-                .child(
-                    row()
-                        .h(22.)
-                        .px(6.)
-                        .gap(4.)
-                        .rounded(5.)
-                        .items_center()
-                        .cursor(Cursor::Pointer)
-                        .text_size(10.5)
-                        .text_color(MUTED)
-                        .hover(|s| s.bg(white(20)).text_color(TEXT))
-                        .on_click(copy)
-                        .child(text_signal(move || {
-                            if copied.get() {
-                                "✓ Copied".into()
-                            } else {
-                                "Copy".into()
-                            }
-                        })),
-                ),
+                .child(fit_toggle)
+                .child(copy_button),
+        );
+    let body = {
+        let fit = fit.clone();
+        switch(
+            move || fit.get(),
+            move |fit, cx| {
+                if fit {
+                    return column()
+                        .w_full()
+                        .min_w(0.)
+                        .overflow_hidden()
+                        .px(12.)
+                        .py(CODE_PAD_Y)
+                        .child(code(true).w_full().min_w(0.));
+                }
+                // Scroll views have a default height: size this one to its lines.
+                let lines = this.clone();
+                scroll_x(cx.state(0_f32))
+                    .w_full()
+                    .reactive_style(move || {
+                        let count = match lines() {
+                            Some(md::Block::Code { run, .. }) => code_lines(&run.text),
+                            _ => 1,
+                        };
+                        Styles::new().h(count as f32 * CODE_LINE + 2. * CODE_PAD_Y)
+                    })
+                    .child(column().px(12.).py(CODE_PAD_Y).child(code(false)))
+            },
         )
-        .child(
-            // Scroll views have a default height: size this one to its lines.
-            scroll_x(offset)
-                .w_full()
-                .reactive_style(move || {
-                    let lines = match height_of() {
-                        Some(md::Block::Code { run, .. }) => {
-                            run.text.trim_end_matches('\n').lines().count().max(1)
-                        }
-                        _ => 1,
-                    };
-                    Styles::new().h(lines as f32 * LINE + 20.)
-                })
-                .child(column().px(12.).py(10.).child(code)),
-        )
+        .w_full()
+    };
+    column()
+        .w_full()
+        .min_w(0.)
+        .rounded(10.)
+        .bg(ink(0.035))
+        .border(1.)
+        .border_color(HAIRLINE)
+        .overflow_hidden()
+        .child(header)
+        .child(body)
 }
 
 fn row_view() -> View {
@@ -1039,7 +1469,7 @@ fn table(
             row()
                 .w_full()
                 .border_edges(rule())
-                .border_color(white(26))
+                .border_color(hairline(0.10))
                 .children((0..columns).map(move |c| cell(None, c)))
         };
         let body = keyed(
@@ -1049,7 +1479,7 @@ fn table(
                 row()
                     .w_full()
                     .border_edges(rule())
-                    .border_color(white(20))
+                    .border_color(hairline(0.10))
                     .children((0..columns).map(move |c| cell(Some(r), c)))
             },
         )
@@ -1059,774 +1489,88 @@ fn table(
     .w_full()
 }
 
-// Tool groups ----------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn summary(tools: &[(PartKind, Tool)]) -> String {
-    let count = |verbs: &[&str]| {
-        tools
-            .iter()
-            .filter(|(_, t)| verbs.contains(&t.verb))
-            .count()
-    };
-    let thoughts = tools
-        .iter()
-        .filter(|(k, _)| *k == PartKind::Reasoning)
-        .count();
-    let failed = tools.iter().filter(|(_, t)| t.error).count();
-    let mut parts = Vec::new();
-    let mut add = |n: usize, one: &str, many: &str| {
-        if n == 1 {
-            parts.push(one.to_owned());
-        } else if n > 1 {
-            parts.push(many.replace('N', &n.to_string()));
-        }
-    };
-    add(thoughts, "thought process", "thought N times");
-    add(count(&["Run"]), "ran 1 command", "ran N commands");
-    add(
-        count(&["Edit", "Write", "Patch"]),
-        "edited 1 file",
-        "edited N files",
-    );
-    add(count(&["Read"]), "read 1 file", "read N files");
-    add(
-        count(&["Search", "Glob"]),
-        "searched once",
-        "searched N times",
-    );
-    add(
-        count(&["Fetch", "Web"]),
-        "fetched 1 page",
-        "fetched N pages",
-    );
-    add(count(&["Agent"]), "ran 1 agent", "ran N agents");
-    add(count(&["Todo"]), "updated todos", "updated todos");
-    add(count(&["Tool", "MCP"]), "used 1 tool", "used N tools");
-    add(failed, "1 failed", "N failed");
-    let mut text = parts.join(" · ");
-    if let Some(first) = text.get_mut(0..1) {
-        first.make_ascii_uppercase();
+    #[test]
+    fn gaps_follow_top_gap_for() {
+        use RowKind::*;
+        assert_eq!(top_gap(None, User), 0.);
+        assert_eq!(top_gap(None, Text), 0.);
+        // Turn starts: a user bubble, or an entry's first row.
+        assert_eq!(top_gap(Some((Text, false)), User), 16.);
+        assert_eq!(top_gap(Some((User, false)), Text), 16.);
+        assert_eq!(top_gap(Some((User, false)), Group), 16.);
+        // Within an entry: 12 around tool groups, 8 else.
+        assert_eq!(top_gap(Some((Text, true)), Group), 12.);
+        assert_eq!(top_gap(Some((Group, true)), Text), 12.);
+        assert_eq!(top_gap(Some((Group, true)), Error), 12.);
+        assert_eq!(top_gap(Some((Text, true)), Text), 8.);
+        assert_eq!(top_gap(Some((Text, true)), Error), 8.);
     }
-    text
-}
 
-/// A group is live while a tool runs or its thought is still streaming.
-fn group_running(ctx: &Ctx, members: &Signal<Vec<String>>) -> bool {
-    let transcript = ctx.transcript.borrow();
-    let streaming = transcript.streaming.get();
-    let last_block = transcript.blocks.with(|b| b.last().cloned());
-    members.with(|keys| {
-        let open_tool = keys.iter().any(|key| {
-            transcript
-                .parts
-                .get(key)
-                .is_some_and(|p| p.kind == PartKind::Tool && !p.tool.with(|t| t.resolved))
-        });
-        // The newest group of a streaming turn is still gathering rows.
-        let newest = matches!(&last_block, Some(Block::Group(key)) if keys.first() == Some(key));
-        open_tool || (streaming && newest)
-    })
-}
+    #[test]
+    fn timestamps_format_like_zeron() {
+        // 2024-07-01T15:45:00Z.
+        let ms = 1_719_848_700_000;
+        assert_eq!(format_timestamp(ms, 0), "Jul 1, 3:45 PM");
+        assert_eq!(format_timestamp(ms + 59_999, 0), "Jul 1, 3:45 PM");
+        // UTC-7 is still the morning; UTC+9 is past midnight.
+        assert_eq!(format_timestamp(ms, -7 * 3600), "Jul 1, 8:45 AM");
+        assert_eq!(format_timestamp(ms, 9 * 3600), "Jul 2, 12:45 AM");
+        // Noon and midnight read 12.
+        assert_eq!(format_timestamp(1_704_110_400_000, 0), "Jan 1, 12:00 PM");
+        assert_eq!(format_timestamp(1_709_164_805_000, 0), "Feb 29, 12:00 AM");
+        assert_eq!(format_timestamp(0, 0), "Jan 1, 12:00 AM");
+        assert_eq!(format_timestamp(-1, 0), "Dec 31, 11:59 PM");
+    }
 
-fn tool_group(cx: &mut Context, ctx: &Ctx, key: &str, members: Signal<Vec<String>>) -> View {
-    // Live groups start open; history arrives folded, as in Zeron.
-    let live = group_running(ctx, &members);
-    let memory = format!("group:{key}");
-    let remembered = ctx.toggles.get(&memory);
-    let open = cx.state(Tween::settled(if remembered.unwrap_or(live) {
-        1.
-    } else {
-        0.
-    }));
-    let user_toggled = Rc::new(Cell::new(remembered.is_some()));
-    // Fold once the group finishes, unless the reader opened it.
-    {
-        let (ctx2, members2, open2, toggled, memory2) = (
-            ctx.clone(),
-            members.clone(),
-            open.clone(),
-            user_toggled.clone(),
-            memory.clone(),
+    #[test]
+    fn user_bubbles_collapse_past_five_lines() {
+        assert!(!user_needs_collapse("a\nb\nc\nd\ne", 0.));
+        assert!(user_needs_collapse("a\nb\nc\nd\ne\nf", 0.));
+        // Unmeasured: the 400 character proxy.
+        assert!(!user_needs_collapse(&"x".repeat(400), 0.));
+        assert!(user_needs_collapse(&"x".repeat(401), 0.));
+        // Measured: the height decides.
+        assert!(!user_needs_collapse(&"x".repeat(900), 110.));
+        assert!(user_needs_collapse("short", 132.));
+        // Source lines always fold, however short they lay out.
+        assert!(user_needs_collapse("1\n2\n3\n4\n5\n6", 50.));
+    }
+
+    #[test]
+    fn fold_resize_scales_with_travel() {
+        assert_eq!(user_resize_ms(0.), 220.);
+        assert_eq!(user_resize_ms(-40.), 220.);
+        assert_eq!(user_resize_ms(100.), 252.);
+        assert_eq!(user_resize_ms(2000.), 850.);
+        assert_eq!(user_resize_spec(500.).1, super::super::theme::EASE_OUT);
+        assert_eq!(user_resize_spec(501.).1, super::super::theme::EASE_IN_OUT);
+        assert!((user_resize_spec(100.).0 - 0.252).abs() < 1e-6);
+        let fold = Fold {
+            from: 132.,
+            to: 532.,
+            at: 1.,
+            spec: user_resize_spec(400.),
+        };
+        assert_eq!(fold.value(0.5), 132.);
+        assert_eq!(fold.value(fold.end()), 532.);
+    }
+
+    #[test]
+    fn code_bodies_drop_a_trailing_newline() {
+        assert_eq!(code_lines(""), 1);
+        assert_eq!(code_lines("a\nb"), 2);
+        assert_eq!(code_lines("a\nb\n"), 2);
+    }
+
+    #[test]
+    fn error_messages_are_one_line() {
+        assert_eq!(
+            single_line("  exit 1\n\tstderr:  boom "),
+            "exit 1 stderr: boom"
         );
-        let was_running = Cell::new(live);
-        let effect = cx.runtime().effect(move || {
-            let running = group_running(&ctx2, &members2);
-            if was_running.replace(running) && !running && !toggled.get() {
-                let now = ctx2.anim.now();
-                open2.update(|t| *t = t.toward(0., now, 0.22));
-                ctx2.toggles.set(&memory2, false);
-                ctx2.anim.keep(0.3);
-            }
-        });
-        cx.retain(effect);
     }
-    // The title shimmers while the group runs.
-    let shimmer = Rc::new(std::cell::RefCell::new(None::<AmbientGuard>));
-    let title = {
-        let (ctx, members) = (ctx.clone(), members.clone());
-        let shimmer = shimmer.clone();
-        rich_text_signal(move || {
-            let tools: Vec<_> = members.with(|keys| {
-                let transcript = ctx.transcript.borrow();
-                keys.iter()
-                    .filter_map(|key| transcript.parts.get(key))
-                    .map(|p| (p.kind, p.tool.get()))
-                    .collect()
-            });
-            let text_ = summary(&tools);
-            let running = group_running(&ctx, &members);
-            {
-                let mut guard = shimmer.borrow_mut();
-                match (running, guard.is_some()) {
-                    (true, false) => *guard = Some(ctx.anim.ambient()),
-                    (false, true) => *guard = None,
-                    _ => {}
-                }
-            }
-            if !running {
-                return vec![text_span(text_)];
-            }
-            // Zeron's 3.4 s sweep: a soft peak of full white across muted.
-            let phase = (ctx.anim.ambient_clock.get() / 3.4).rem_euclid(1.);
-            let centre = -0.4 + 1.8 * phase;
-            let last = (text_.chars().count().max(2) - 1) as f32;
-            text_
-                .chars()
-                .enumerate()
-                .map(|(i, ch)| {
-                    let glow = smoothstep(1. - (i as f32 / last - centre).abs() / 0.36);
-                    text_span(ch.to_string()).text_color(mix(MUTED, TEXT, glow))
-                })
-                .collect()
-        })
-    };
-    let chevron = {
-        let (open, anim) = (open.clone(), ctx.anim.clone());
-        svg_signal("toggle", move || {
-            let tween = open.get();
-            let value = tween.value(anim.at(tween.at + 0.22), 0.22);
-            Arc::new(
-                icon_data("chevron")
-                    .tinted(MUTED)
-                    .transformed(Affine::rotation(-FRAC_PI_2 * (1. - value))),
-            )
-        })
-        .size(14., 14.)
-    };
-    let rows = {
-        let (ctx, members, open) = (ctx.clone(), members.clone(), open.clone());
-        let (keys, opened_by) = (members.clone(), open.clone());
-        // Rows mount on first open: folded history costs one header each.
-        let opened = Cell::new(false);
-        keyed(
-            move || {
-                if opened_by.with(|t| t.target > 0.5) {
-                    opened.set(true);
-                }
-                if opened.get() { keys.get() } else { Vec::new() }
-            },
-            move |key, cx| {
-                // Look the part up now: groups outlive the parts that exist
-                // when they are built.
-                let part = ctx.transcript.borrow().parts.get(&key).cloned();
-                match part {
-                    Some(part) => {
-                        let (members, this) = (members.clone(), key.clone());
-                        let position = move || {
-                            members.with(|m| (m.first() == Some(&this), m.last() == Some(&this)))
-                        };
-                        tool_row(cx, &ctx, &key, part, position, open.clone())
-                    }
-                    None => div(),
-                }
-            },
-        )
-        .w_full()
-    };
-    let toggle = {
-        let (open, anim, toggles) = (open.clone(), ctx.anim.clone(), ctx.toggles.clone());
-        move || {
-            user_toggled.set(true);
-            let now = anim.now();
-            open.update(|t| {
-                let target = if t.target > 0.5 { 0. } else { 1. };
-                *t = t.toward(target, now, 0.22);
-                toggles.set(&memory, target > 0.5);
-            });
-            anim.keep(0.3);
-        }
-    };
-    column()
-        .w_full()
-        .child(
-            row()
-                .h(26.)
-                .gap(6.)
-                .pr(6.)
-                .items_center()
-                .text_size(12.5)
-                .line_height(18.)
-                .text_color(MUTED)
-                .hover(|s| s.text_color(TEXT))
-                .cursor(Cursor::Pointer)
-                .on_click(toggle)
-                .child(
-                    row()
-                        .size(22., 18.)
-                        .items_center()
-                        .justify_center()
-                        .child(chevron),
-                )
-                .child(title),
-        )
-        .child(column().w_full().pt(2.).child(rows))
-}
-
-/// Lines a row shows when expanded: output, a diff, or a thought.
-fn detail_lines(
-    tool: &Tool,
-    thought: Option<&str>,
-    fetched: Option<&str>,
-) -> Vec<(String, Color, Option<Color>)> {
-    const CAP: usize = 40;
-    if let Some(thought) = thought {
-        return wrap(thought, 92)
-            .into_iter()
-            .map(|l| (l, FAINT, None))
-            .collect();
-    }
-    let diff = match (fetched, &tool.diff) {
-        (Some(json), _) if tool.diff_ref.is_some() && json.trim_start().starts_with('{') => {
-            serde_json::from_str::<serde_json::Value>(json)
-                .ok()
-                .and_then(|v| {
-                    Some((
-                        v.get("oldText").and_then(|t| t.as_str()).map(str::to_owned),
-                        v.get("newText")?.as_str()?.to_owned(),
-                    ))
-                })
-        }
-        (_, Some((_, old, new))) => Some((old.clone(), new.clone())),
-        _ => None,
-    };
-    if let Some((old, new)) = diff {
-        let mut lines: Vec<_> = md::line_diff(old.as_deref().unwrap_or(""), &new, 2)
-            .into_iter()
-            .map(|line| match line {
-                None => ("⋯".to_owned(), FAINT, None),
-                Some((Change::Added, l)) => (
-                    format!("+ {l}"),
-                    Color(120, 230, 170, 255),
-                    Some(Color(64, 214, 150, 26)),
-                ),
-                Some((Change::Removed, l)) => (
-                    format!("− {l}"),
-                    Color(255, 150, 150, 255),
-                    Some(Color(255, 112, 114, 24)),
-                ),
-                Some((Change::Same, l)) => (format!("  {l}"), MUTED, None),
-            })
-            .collect();
-        if lines.len() > CAP {
-            let more = lines.len() - CAP;
-            lines.truncate(CAP);
-            lines.push((format!("… {more} more lines"), FAINT, None));
-        }
-        return lines;
-    }
-    let source = fetched.unwrap_or(&tool.output);
-    let mut lines: Vec<_> = source
-        .lines()
-        .map(|l| {
-            let color = if l.contains("error") || l.contains("FAILED") || l.contains("panicked") {
-                fade(DANGER, 0.9)
-            } else {
-                MUTED
-            };
-            (l.to_owned(), color, None)
-        })
-        .collect();
-    while lines.last().is_some_and(|(l, _, _)| l.trim().is_empty()) {
-        lines.pop();
-    }
-    if lines.len() > CAP {
-        let more = lines.len() - CAP;
-        lines.truncate(CAP);
-        lines.push((format!("… {more} more lines"), FAINT, None));
-    }
-    lines
-}
-
-fn wrap(text: &str, columns: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let mut line = String::new();
-        for word in paragraph.split(' ') {
-            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > columns {
-                lines.push(std::mem::take(&mut line));
-            }
-            if !line.is_empty() {
-                line.push(' ');
-            }
-            line.push_str(word);
-        }
-        lines.push(line);
-    }
-    while lines.last().is_some_and(|l| l.trim().is_empty()) {
-        lines.pop();
-    }
-    lines
-}
-
-fn tool_row(
-    cx: &mut Context,
-    ctx: &Ctx,
-    key: &str,
-    part: Rc<model::Part>,
-    position: impl Fn() -> (bool, bool) + Clone + 'static,
-    group_open: Signal<Tween>,
-) -> View {
-    const LINE: f32 = 18.;
-    let think = part.kind == PartKind::Reasoning;
-    let born = part.born;
-    let anim = ctx.anim.clone();
-    // Thoughts stream open and fold when their turn moves on.
-    let memory = format!("tool:{key}");
-    let expanded = cx.state(Tween::settled(
-        if ctx.toggles.get(&memory).unwrap_or(think && born.is_some()) {
-            1.
-        } else {
-            0.
-        },
-    ));
-    let fetched = cx.state(None::<String>);
-    if born.is_some_and(|born| anim.now() < born + 0.6) {
-        anim.keep(0.7);
-    }
-    let tool = part.tool.clone();
-    let tint = {
-        let tool = tool.clone();
-        move || {
-            if tool.with(|t| t.error) {
-                DANGER
-            } else {
-                MUTED
-            }
-        }
-    };
-    // Zeron's row entrance: height over 360 ms expo, connector 480 ms quint,
-    // content rising as the branch draws.
-    let timeline = {
-        let anim = anim.clone();
-        move || match born {
-            Some(born) => ease_out_quint((anim.at(born + 0.5) - born) / 0.48),
-            None => 1.,
-        }
-    };
-    let row_style = {
-        let (anim, group_open, tint, timeline) = (
-            anim.clone(),
-            group_open.clone(),
-            tint.clone(),
-            timeline.clone(),
-        );
-        move || {
-            let grow = match born {
-                Some(born) => ease_out_expo((anim.at(born + 0.4) - born) / 0.36),
-                None => 1.,
-            };
-            let _ = &timeline;
-            let fold = group_open.get();
-            let open = fold.value(anim.at(fold.at + 0.22), 0.22);
-            Styles::new()
-                .h(32. * grow * open)
-                .opacity(open)
-                .text_color(tint())
-        }
-    };
-    let (line_span, branch_span) = ((0.2, 0.62), (0.55, 1.));
-    let line = {
-        let (position, timeline) = (position.clone(), timeline.clone());
-        div().w(1.).bg(white(34)).reactive_style(move || {
-            let (_, last) = position();
-            let p = window(timeline(), line_span.0, line_span.1);
-            Styles::new().h(if last { 16. } else { 32. } * p)
-        })
-    };
-    let branch = {
-        let timeline = timeline.clone();
-        div().h(1.).bg(white(34)).reactive_style(move || {
-            Styles::new().w(14. * window(timeline(), branch_span.0, branch_span.1))
-        })
-    };
-    let content_style = {
-        let timeline = timeline.clone();
-        move || {
-            let p = window(timeline(), branch_span.0, branch_span.1);
-            Styles::new().opacity(p).translate(0., 4. * (1. - p))
-        }
-    };
-    let icon_view = {
-        let (tool, tint) = (tool.clone(), tint.clone());
-        svg_signal("tool", move || {
-            let name = if think {
-                "thought"
-            } else {
-                tool.with(|t| t.icon)
-            };
-            Arc::new(icon_data(name).tinted(tint()))
-        })
-        .size(15., 15.)
-        .ml(5.)
-        .mt(8.5)
-    };
-    let label = {
-        let (tool, text_, streaming) = (
-            tool.clone(),
-            part.text.clone(),
-            ctx.transcript.borrow().streaming.clone(),
-        );
-        text_signal(move || {
-            if think {
-                let live = streaming.get() && text_.with(|t| !t.is_empty()) && born.is_some();
-                if live {
-                    "Thinking".into()
-                } else {
-                    "Thought process".into()
-                }
-            } else {
-                tool.with(|t| t.verb.to_owned())
-            }
-        })
-        .shrink_0()
-    };
-    let detail = {
-        let (tool, badge) = (tool.clone(), tool.clone());
-        row()
-            .min_w(0.)
-            .gap(6.)
-            .items_center()
-            .child(
-                text_signal(move || {
-                    tool.with(|t| {
-                        let detail = if t.file {
-                            t.detail.rsplit('/').next().unwrap_or(&t.detail)
-                        } else {
-                            &t.detail
-                        };
-                        match &t.subagent_tail {
-                            Some(tail) if !t.resolved => format!("{detail} — {tail}"),
-                            _ => detail.to_owned(),
-                        }
-                    })
-                })
-                .truncate()
-                .min_w(0.),
-            )
-            .reactive_style(move || {
-                if badge.with(|t| t.file) {
-                    Styles::new()
-                        .h(22.)
-                        .pl(7.)
-                        .pr(8.)
-                        .rounded(6.)
-                        .bg(white(14))
-                        .border(1.)
-                        .border_color(white(12))
-                } else {
-                    Styles::new().h(22.).px(0.).bg(white(0)).border(0.)
-                }
-            })
-            .when(think, |d| d.hidden())
-    };
-    let stats = {
-        let tool = tool.clone();
-        rich_text_signal(move || match tool.with(|t| t.stats) {
-            Some((added, removed)) => vec![
-                text_span(format!("+{added} ")).text_color(ADDED),
-                text_span(format!("−{removed}")).text_color(DANGER),
-            ],
-            None => Vec::new(),
-        })
-        .shrink_0()
-        .text_size(11.5)
-        .font_family(FontFamily::Monospace)
-    };
-    let running = {
-        let tool = tool.clone();
-        div()
-            .size(6., 6.)
-            .rounded(3.)
-            .bg(ACCENT)
-            .shrink_0()
-            .reactive_style(move || {
-                if !think && !tool.with(|t| t.resolved) {
-                    Styles::new().flex()
-                } else {
-                    Styles::new().hidden()
-                }
-            })
-    };
-    let lines = {
-        let (tool, text_, fetched) = (tool.clone(), part.text.clone(), fetched.clone());
-        move || {
-            let thought = think.then(|| text_.get());
-            fetched.with(|f| tool.with(|t| detail_lines(t, thought.as_deref(), f.as_deref())))
-        }
-    };
-    let body = {
-        let lines = lines.clone();
-        let (anim, expanded, group_open) = (anim.clone(), expanded.clone(), group_open.clone());
-        let text_view = rich_text_signal({
-            let lines = lines.clone();
-            move || {
-                let lines = lines();
-                let count = lines.len();
-                lines
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (line, color, background))| {
-                        let text_ = if i + 1 < count { line + "\n" } else { line };
-                        let span = text_span(text_).text_color(color);
-                        match background {
-                            Some(bg) => span.background(bg),
-                            None => span,
-                        }
-                    })
-                    .collect()
-            }
-        })
-        .text_wrap(false)
-        .text_size(12.)
-        .line_height(LINE)
-        .when(!think, |t| t.font_family(FontFamily::Monospace));
-        column()
-            .w_full()
-            .pl(56.)
-            .pr(8.)
-            .overflow_hidden()
-            .reactive_style(move || {
-                let open = expanded.get();
-                let fold = group_open.get();
-                let p = open.value(anim.at(open.at + 0.2), 0.2)
-                    * fold.value(anim.at(fold.at + 0.22), 0.22);
-                let count = lines().len();
-                if p <= 0.001 || count == 0 {
-                    return Styles::new().hidden();
-                }
-                let full = count as f32 * LINE + 14.;
-                Styles::new().flex().h(full * p).opacity(p.powf(0.6))
-            })
-            .child(column().w_full().py(6.).child(text_view))
-    };
-    // Close a streaming thought once the turn moves past it.
-    if think && born.is_some() {
-        let (expanded, anim, streaming, toggles, memory) = (
-            expanded.clone(),
-            anim.clone(),
-            ctx.transcript.borrow().streaming.clone(),
-            ctx.toggles.clone(),
-            memory.clone(),
-        );
-        let was = Cell::new(streaming.with_untracked(|live| *live));
-        let effect = cx.runtime().effect(move || {
-            let live = streaming.get();
-            if was.replace(live) && !live {
-                let now = anim.now();
-                expanded.update(|t| *t = t.toward(0., now, 0.2));
-                toggles.set(&memory, false);
-                anim.keep(0.3);
-            }
-        });
-        cx.retain(effect);
-    }
-    let toggle = {
-        let (expanded, anim, tool, fetched, rpc, tasks, toggles) = (
-            expanded.clone(),
-            anim.clone(),
-            tool.clone(),
-            fetched.clone(),
-            ctx.rpc.clone(),
-            ctx.tasks.clone(),
-            ctx.toggles.clone(),
-        );
-        move || {
-            let now = anim.now();
-            let opening = expanded.with_untracked(|t| t.target < 0.5);
-            expanded.update(|t| *t = t.toward(if opening { 1. } else { 0. }, now, 0.2));
-            toggles.set(&memory, opening);
-            anim.keep(0.3);
-            // Full output or diff, fetched once on first open.
-            let blob = tool.with_untracked(|t| t.diff_ref.clone().or_else(|| t.output_ref.clone()));
-            if opening
-                && fetched.with_untracked(Option::is_none)
-                && let Some(blob) = blob
-                && let Some(rpc) = &rpc
-            {
-                let (rpc, fetched) = (rpc.clone(), fetched.clone());
-                tasks.spawn(async move {
-                    if let Ok(reply) = rpc.call("FetchToolBlob", json!({ "blobRef": blob })).await
-                        && let Some(text_) = reply.get("text").and_then(|t| t.as_str())
-                    {
-                        fetched.set(Some(text_.to_owned()));
-                    }
-                });
-            }
-        }
-    };
-    column()
-        .w_full()
-        .child(
-            row()
-                .w_full()
-                .overflow_hidden()
-                .items_start()
-                .text_size(12.5)
-                .line_height(18.)
-                .hover(|s| s.text_color(TEXT))
-                .cursor(Cursor::Pointer)
-                .reactive_style(row_style)
-                .on_click(toggle)
-                .child(
-                    row()
-                        .w(48.)
-                        .h(32.)
-                        .shrink_0()
-                        .items_start()
-                        .child(div().w(10.))
-                        .child(line)
-                        .child(column().w(14.).pt(16.).child(branch))
-                        .child(icon_view),
-                )
-                .child(
-                    row()
-                        .grow()
-                        .min_w(0.)
-                        .h(32.)
-                        .ml(8.)
-                        .gap(8.)
-                        .items_center()
-                        .overflow_hidden()
-                        .reactive_style(content_style)
-                        .child(label)
-                        .child(detail)
-                        .child(stats)
-                        .child(running),
-                ),
-        )
-        .child(body)
-}
-
-// Working trailer --------------------------------------------------------------
-
-const WORDS: [&str; 12] = [
-    "Thinking",
-    "Reading",
-    "Tracing",
-    "Untangling",
-    "Pondering",
-    "Weaving",
-    "Wrangling",
-    "Mulling",
-    "Sifting",
-    "Tinkering",
-    "Composing",
-    "Assembling",
-];
-
-/// "Thinking… 12s" under a live turn, with a pulsing trio of dots.
-pub fn trailer(
-    cx: &mut Context,
-    anim: &Anim,
-    working: impl Fn() -> bool + Clone + 'static,
-) -> View {
-    let started = cx.state(None::<f32>);
-    let guard = Rc::new(std::cell::RefCell::new(None::<AmbientGuard>));
-    {
-        let (anim, started, working, guard) = (
-            anim.clone(),
-            started.clone(),
-            working.clone(),
-            guard.clone(),
-        );
-        let effect = cx.runtime().effect(move || {
-            let live = working();
-            let mut slot = guard.borrow_mut();
-            if live && slot.is_none() {
-                *slot = Some(anim.ambient());
-                started.set(Some(anim.now()));
-            } else if !live && slot.is_some() {
-                *slot = None;
-                started.set(None);
-            }
-        });
-        cx.retain(effect);
-    }
-    // Zeron's gradient spinner: 3×3 dots, rows pale blue, peach, pink; each
-    // dips to 10% over 45% of a 750 ms cycle, with the wave climbing upward.
-    let spinner = column().gap(1.25).children((0..3).map(|row_| {
-        let anim = anim.clone();
-        row().gap(1.25).children((0..3).map(move |col| {
-            let anim = anim.clone();
-            let colour = [
-                Color(182, 211, 239, 255),
-                Color(237, 177, 133, 255),
-                Color(248, 136, 160, 255),
-            ][row_];
-            let phase = ((2 - row_) as f32 + (col as f32 - 1.).abs()) / 4.;
-            div()
-                .size(2.5, 2.5)
-                .rounded(1.25)
-                .bg(colour)
-                .reactive_style(move || {
-                    let t = (anim.ambient_clock.get() / 0.75 - phase).rem_euclid(1.);
-                    let opacity = if t < 0.45 {
-                        1. - 0.9 * (1. - (1. - t / 0.45).powi(3))
-                    } else if t < 0.92 {
-                        0.1
-                    } else {
-                        1.
-                    };
-                    Styles::new().opacity(opacity)
-                })
-        }))
-    }));
-    let word = {
-        let (anim, started) = (anim.clone(), started.clone());
-        text_signal(move || {
-            let since = started.get().unwrap_or(0.);
-            let index = ((anim.ambient_clock.get() - since) / 7.).max(0.) as usize % WORDS.len();
-            format!("{}…", WORDS[index])
-        })
-        .text_size(12.)
-        .text_color(MUTED)
-    };
-    let elapsed = {
-        let (anim, started) = (anim.clone(), started.clone());
-        text_signal(move || {
-            let seconds = (anim.ambient_clock.get() - started.get().unwrap_or(0.)).max(0.) as u32;
-            if seconds >= 60 {
-                format!("{}m {}s", seconds / 60, seconds % 60)
-            } else {
-                format!("{seconds}s")
-            }
-        })
-        .text_size(11.)
-        .mt(1.)
-        .text_color(FAINT)
-    };
-    row()
-        .pt(16.)
-        .gap(8.)
-        .items_center()
-        .reactive_style(move || {
-            if working() {
-                Styles::new().flex()
-            } else {
-                Styles::new().hidden()
-            }
-        })
-        .child(spinner)
-        .child(word)
-        .child(elapsed)
 }

@@ -9,23 +9,17 @@
 use serde_json::{Value, json};
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet},
-    f32::consts::FRAC_PI_2,
+    collections::HashMap,
     rc::Rc,
-    sync::Arc,
     time::Duration,
 };
 use zgui::{
-    affine::Affine,
-    compose::prelude::*,
-    cursor::Cursor,
-    input::{EventPhase, InputEvent, Key},
-    reactive::Signal,
-    scene::Color,
-    timer::sleep,
+    compose::prelude::*, cursor::Cursor, input::InputEvent, reactive::Signal, timer::sleep,
 };
 use zgui_desktop::{Application, WindowOptions};
 
+#[path = "support/zeron_composer.rs"]
+mod composer;
 #[cfg(target_os = "macos")]
 #[path = "support/glass.rs"]
 mod glass;
@@ -35,12 +29,19 @@ mod markdown;
 mod model;
 #[path = "support/zeron_rpc.rs"]
 mod rpc;
+#[path = "support/zeron_sidebar.rs"]
+mod sidebar;
+#[path = "support/zeron_theme.rs"]
+#[allow(dead_code)]
+mod theme;
+#[path = "support/zeron_tools.rs"]
+mod tools;
 #[path = "support/zeron_view.rs"]
 mod view;
 
 use model::{ChatRow, Status, Transcript};
 use rpc::Rpc;
-use view::{ACCENT, Anim, DANGER, FAINT, MUTED, TEXT, icon, icon_data, white};
+use view::{Anim, MUTED, TEXT, white};
 
 const TITLE: &str = "Zeron · zgui";
 const WIDTH: f64 = 1320.;
@@ -49,14 +50,18 @@ const HEIGHT: f64 = 880.;
 /// estimating the heights of rows not yet mounted.
 const COLUMN: f32 = 736.;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Application::new()
+    let mut application = Application::new();
+    for font in theme::fonts() {
+        application = application.font(font);
+    }
+    application
         .window(WindowOptions {
             title: TITLE.into(),
             width: WIDTH,
             height: HEIGHT,
             transparent: true,
             decorations: cfg!(target_os = "macos"),
-            min_size: Some((900., 580.)),
+            min_size: Some((900., 600.)),
             ..Default::default()
         })
         .run(move |cx| {
@@ -65,13 +70,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let window = cx.window.clone();
                 cx.tasks.spawn(async move {
                     sleep(Duration::from_millis(1)).await;
-                    if glass::inset_titlebar(TITLE) {
+                    // Zeron's backdrop: the colourless under-window material,
+                    // untinted, unsaturated and blurred at 60 pt, under the
+                    // shell's own 80% tint.
+                    if glass::inset_titlebar_with(TITLE, glass::UNDER_WINDOW_BACKGROUND) {
                         window.set_inner_size(WIDTH, HEIGHT);
+                    }
+                    // AppKit rebuilds the effect layers on focus and
+                    // appearance changes; gpui re-strips them on every layer
+                    // update, this on a slow timer.
+                    loop {
+                        glass::plain_backdrop(TITLE);
+                        sleep(Duration::from_millis(750)).await;
                     }
                 });
             }
             cx.ui.theme.hover = white(0);
-            cx.ui.theme.accent = white(52);
+            // Zeron's scrollbar thumb: text at 30%.
+            cx.ui.theme.accent = theme::alpha(theme::TEXT, 0.3);
             // One connection at a time; the UI below remounts on each one.
             let generation = cx.ui.signal(0_u32);
             let offline = cx.ui.signal(Some("Connecting to Zeron…".to_owned()));
@@ -153,13 +169,7 @@ fn preview(cx: &mut Context, path: &str) -> View {
         ]}
     ]});
     transcript.borrow_mut().apply(&frame, anim.now());
-    let ctx = view::Ctx {
-        anim: anim.clone(),
-        rpc: None,
-        transcript: transcript.clone(),
-        tasks: cx.tasks(),
-        toggles: Default::default(),
-    };
+    let ctx = view::Ctx::new(anim.clone(), None, transcript.clone(), cx.tasks());
     let blocks = transcript.borrow().blocks.clone();
     let body = {
         let (keys, previous) = (blocks.clone(), blocks.clone());
@@ -181,7 +191,8 @@ fn preview(cx: &mut Context, path: &str) -> View {
     column()
         .w_full()
         .h_full()
-        .bg(Color(13, 13, 15, 168))
+        .bg(theme::GLASS)
+        .font_family(theme::SANS)
         .text_color(TEXT)
         .child(div().w_full().h(38.))
         .child(
@@ -222,7 +233,8 @@ fn waiting(message: Signal<Option<String>>, window: zgui_desktop::WindowHandle) 
     column()
         .w_full()
         .h_full()
-        .bg(Color(10, 13, 20, 90))
+        .bg(theme::GLASS)
+        .font_family(theme::SANS)
         .text_color(TEXT)
         .child(drag_region(div().w_full().h(52.), window))
         .child(
@@ -356,367 +368,12 @@ fn app(cx: &mut Context, rpc: Rpc, window: zgui_desktop::WindowHandle) -> View {
         .w_full()
         .h_full()
         .items_stretch()
-        .bg(Color(13, 13, 15, 168))
+        .bg(theme::GLASS)
+        .font_family(theme::SANS)
+        .text_size(14.)
         .text_color(TEXT)
-        .child(sidebar(cx, &state, window))
+        .child(sidebar::sidebar(cx, &state, window))
         .child(column().grow().min_w(0.).child(content))
-}
-
-// Sidebar --------------------------------------------------------------------
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-enum SideKey {
-    Project(String),
-    Chat(String),
-}
-
-fn sidebar(cx: &mut Context, state: &App, window: zgui_desktop::WindowHandle) -> View {
-    let offset = cx.state(0_f32);
-    let query = cx.state(String::new());
-    let collapsed = cx.state(HashSet::<String>::new());
-    let items = {
-        let (rows, query, collapsed) = (state.rows.clone(), query.clone(), collapsed.clone());
-        move || {
-            let needle = query.with(|q| q.trim().to_lowercase());
-            let collapsed = collapsed.get();
-            // Projects ordered by their most recent session.
-            let mut order: Vec<String> = Vec::new();
-            let mut by_project: HashMap<String, Vec<String>> = HashMap::new();
-            rows.with(|rows| {
-                for row in rows {
-                    if !needle.is_empty()
-                        && !row.title.to_lowercase().contains(&needle)
-                        && !row.project.to_lowercase().contains(&needle)
-                    {
-                        continue;
-                    }
-                    if !by_project.contains_key(&row.project) {
-                        order.push(row.project.clone());
-                    }
-                    by_project
-                        .entry(row.project.clone())
-                        .or_default()
-                        .push(row.id.clone());
-                }
-            });
-            order
-                .into_iter()
-                .flat_map(|project| {
-                    let chats = by_project.remove(&project).unwrap_or_default();
-                    let hidden = collapsed.contains(&project) && needle.is_empty();
-                    std::iter::once(SideKey::Project(project)).chain(
-                        chats
-                            .into_iter()
-                            .filter(move |_| !hidden)
-                            .map(SideKey::Chat),
-                    )
-                })
-                .collect::<Vec<_>>()
-        }
-    };
-    let list = {
-        let (state, collapsed) = (state.clone(), collapsed.clone());
-        keyed(items, move |key, _| match key {
-            SideKey::Project(name) => project_header(&state, &collapsed, name),
-            SideKey::Chat(id) => chat_item(&state, id),
-        })
-        .w_full()
-    };
-    let search = {
-        let placeholder = {
-            let query = query.clone();
-            text("Search sessions")
-                .text_size(12.5)
-                .text_color(FAINT)
-                .reactive_style(move || {
-                    if query.with(String::is_empty) {
-                        Styles::new().flex()
-                    } else {
-                        Styles::new().hidden()
-                    }
-                })
-        };
-        row()
-            .w_full()
-            .h(32.)
-            .px(10.)
-            .gap(8.)
-            .items_center()
-            .rounded(9.)
-            .bg(white(10))
-            .border(1.)
-            .border_color(white(12))
-            .child(icon("search", 13., FAINT))
-            .child(
-                overlay().grow().min_w(0.).child(placeholder).child(
-                    text_input("Search sessions", query)
-                        .w_full()
-                        .h(20.)
-                        .text_size(12.5)
-                        .bg(white(0))
-                        .border(0.)
-                        .p(0.)
-                        .focus(|s| s),
-                ),
-            )
-    };
-    let footer = {
-        let rows = state.rows.clone();
-        row()
-            .w_full()
-            .h(44.)
-            .px(16.)
-            .gap(8.)
-            .items_center()
-            .border_edges(zgui::scene::Insets {
-                top: 1.,
-                right: 0.,
-                bottom: 0.,
-                left: 0.,
-            })
-            .border_color(white(12))
-            .child(div().size(7., 7.).rounded(3.5).bg(Color(64, 214, 150, 255)))
-            .child(text("Connected to Zeron").text_size(12.).text_color(MUTED))
-            .child(div().grow())
-            .child(
-                text_signal(move || format!("{} sessions", rows.with(Vec::len)))
-                    .text_size(11.5)
-                    .text_color(FAINT),
-            )
-    };
-    column()
-        .w(256.)
-        .h_full()
-        .shrink_0()
-        .bg(white(13))
-        .border_edges(zgui::scene::Insets {
-            top: 0.,
-            right: 1.,
-            bottom: 0.,
-            left: 0.,
-        })
-        .border_color(white(26))
-        .child(drag_region(div().w_full().h(38.).shrink_0(), window))
-        .child(column().w_full().px(8.).pt(8.).pb(4.).child(search))
-        .child(
-            scroll(offset)
-                .scrollbar(true)
-                .w_full()
-                .grow()
-                .min_h(0.)
-                .child(column().w_full().px(8.).pt(4.).pb(16.).gap(2.).child(list)),
-        )
-        .child(footer)
-}
-
-fn project_header(state: &App, collapsed: &Signal<HashSet<String>>, name: String) -> View {
-    let count = {
-        let (rows, name) = (state.rows.clone(), name.clone());
-        text_signal(move || {
-            rows.with(|rows| rows.iter().filter(|r| r.project == name).count())
-                .to_string()
-        })
-        .text_size(11.)
-        .text_color(white(70))
-    };
-    let chevron = {
-        let (collapsed, name) = (collapsed.clone(), name.clone());
-        svg_signal("fold", move || {
-            let closed = collapsed.with(|c| c.contains(&name));
-            let angle = if closed { -FRAC_PI_2 } else { 0. };
-            Arc::new(
-                icon_data("chevron")
-                    .tinted(white(90))
-                    .transformed(Affine::rotation(angle)),
-            )
-        })
-        .size(11., 11.)
-    };
-    let toggle = {
-        let (collapsed, name) = (collapsed.clone(), name.clone());
-        move || {
-            collapsed.update(|c| {
-                if !c.remove(&name) {
-                    c.insert(name.clone());
-                }
-            });
-        }
-    };
-    // Zeron's section header: 28 px, muted label, chevron at the right
-    // that turns from right (closed) to down (open).
-    row()
-        .w_full()
-        .h(28.)
-        .mt(12.)
-        .mb(4.)
-        .px(8.)
-        .gap(6.)
-        .items_center()
-        .rounded(8.)
-        .cursor(Cursor::Pointer)
-        .hover(|s| s.bg(white(10)))
-        .on_click(toggle)
-        .child(
-            text(name)
-                .w(0.)
-                .grow()
-                .truncate()
-                .text_size(12.)
-                .font_weight(500)
-                .text_color(white(92)),
-        )
-        .child(count)
-        .child(chevron)
-}
-
-fn chat_item(state: &App, id: String) -> View {
-    let row_of = {
-        let (rows, id) = (state.rows.clone(), id.clone());
-        move || rows.with(|rows| rows.iter().find(|r| r.id == id).cloned())
-    };
-    let title = {
-        let row_of = row_of.clone();
-        text_signal(move || row_of().map(|r| r.title).unwrap_or_default())
-            .w(0.)
-            .grow()
-            .truncate()
-    };
-    let time = {
-        let (row_of, now) = (row_of.clone(), state.now.clone());
-        text_signal(move || {
-            now.get();
-            row_of().map(|r| model::ago(r.updated)).unwrap_or_default()
-        })
-        .shrink_0()
-        .text_size(10.)
-        .font_weight(500)
-        .text_color(FAINT)
-    };
-    let status = {
-        let (statuses, id) = (state.statuses.clone(), id.clone());
-        move || statuses.with(|s| s.get(&id).copied().unwrap_or(Status::Idle))
-    };
-    // The corner: Zeron's mini spinner and "Working", a dot and "Input" /
-    // "Failed", or the relative time.
-    let corner = {
-        let (status, word_status, anim) = (status.clone(), status.clone(), state.anim.clone());
-        let guard = RefCell::new(None::<view::AmbientGuard>);
-        let spinner = column().gap(1.).children((0..3).map(|r| {
-            let (anim, status) = (anim.clone(), status.clone());
-            row().gap(1.).children((0..2).map(move |c| {
-                let (anim, status) = (anim.clone(), status.clone());
-                const RING: [(usize, usize); 6] = [(0, 0), (0, 1), (1, 1), (2, 1), (2, 0), (1, 0)];
-                let k = RING.iter().position(|&cell| cell == (r, c)).unwrap_or(0) as f32;
-                let colour = [
-                    Color(171, 161, 249, 255),
-                    Color(139, 124, 246, 255),
-                    Color(114, 102, 202, 255),
-                ][r];
-                div()
-                    .size(2., 2.)
-                    .rounded(1.)
-                    .bg(colour)
-                    .reactive_style(move || {
-                        // Hidden unless working: no ticking while hidden.
-                        if status() != Status::Working {
-                            return Styles::new();
-                        }
-                        let t = (anim.ambient_clock.get() / 0.75 - k / 6.).rem_euclid(1.);
-                        let o = if t < 0.45 {
-                            1. - 0.9 * (t / 0.45)
-                        } else if t < 0.92 {
-                            0.1
-                        } else {
-                            1.
-                        };
-                        Styles::new().opacity(o)
-                    })
-            }))
-        }));
-        let glyph = div().size(6., 6.).rounded(3.).reactive_style({
-            let status = status.clone();
-            move || match status() {
-                Status::AwaitingInput => Styles::new().flex().bg(ACCENT),
-                Status::Errored => Styles::new().flex().bg(DANGER),
-                _ => Styles::new().hidden(),
-            }
-        });
-        let spinner = spinner.reactive_style({
-            let status = status.clone();
-            move || {
-                let working = status() == Status::Working;
-                let mut slot = guard.borrow_mut();
-                match (working, slot.is_some()) {
-                    (true, false) => *slot = Some(anim.ambient()),
-                    (false, true) => *slot = None,
-                    _ => {}
-                }
-                if working {
-                    Styles::new().flex()
-                } else {
-                    Styles::new().hidden()
-                }
-            }
-        });
-        let word = text_signal(move || match word_status() {
-            Status::Working => "Working".into(),
-            Status::AwaitingInput => "Input".into(),
-            Status::Errored => "Failed".into(),
-            Status::Idle => String::new(),
-        })
-        .text_size(10.)
-        .font_weight(500)
-        .reactive_style({
-            let status = status.clone();
-            move || match status() {
-                Status::Working => Styles::new().flex().text_color(Color(139, 124, 246, 150)),
-                Status::AwaitingInput => Styles::new().flex().text_color(Color(139, 124, 246, 170)),
-                Status::Errored => Styles::new().flex().text_color(Color(248, 113, 113, 170)),
-                Status::Idle => Styles::new().hidden(),
-            }
-        });
-        let time = time.reactive_style(move || {
-            if status() == Status::Idle {
-                Styles::new().flex()
-            } else {
-                Styles::new().hidden()
-            }
-        });
-        row()
-            .shrink_0()
-            .gap(4.)
-            .items_center()
-            .child(spinner)
-            .child(glyph)
-            .child(word)
-            .child(time)
-    };
-    let (selected, select) = (state.selected.clone(), state.selected.clone());
-    let pick = id.clone();
-    button()
-        .w_full()
-        .h(29.)
-        .px(8.)
-        .gap(8.)
-        .rounded(8.)
-        .items_center()
-        .text_size(13.)
-        .bg(white(0))
-        .border(0.)
-        .hover(|s| s.bg(white(24)))
-        .active(|s| s.bg(white(30)))
-        .focus(|s| s)
-        .reactive_style(move || {
-            let on = selected.with(|s| s.as_deref() == Some(id.as_str()));
-            Styles::new()
-                .bg(Color(235, 235, 235, if on { 28 } else { 0 }))
-                .text_color(if on { TEXT } else { white(204) })
-        })
-        .child(title)
-        .child(corner)
-        .on_click(move || {
-            select.set(Some(pick.clone()));
-        })
 }
 
 // Chat -----------------------------------------------------------------------
@@ -734,7 +391,14 @@ fn chat_view(
         (t.blocks.clone(), t.loaded.clone(), t.streaming.clone())
     };
     let page = cx.state(0_f32);
-    let follow = Follow::new(cx, page.clone());
+    // Resting at the end, the list stays there as rows are measured and
+    // messages arrive.
+    let heights = VariableHeights::new(&cx.runtime(), 0, 80.).anchor_end();
+    let follow = Follow::new(cx, page.clone(), heights.clone());
+    // The bottom stack's height (status strip, composer, footer): the
+    // transcript scrolls on under it, fading over it, with its last row
+    // padded clear of it (Zeron's `bottom_clearance`).
+    let stack = cx.state(STACK);
     // ZERON_SCROLL_SPEED=<points/s>: sweep the transcript up and down, like a
     // long trackpad fling, for profiling.
     if let Some(speed) = std::env::var("ZERON_SCROLL_SPEED")
@@ -756,13 +420,12 @@ fn chat_view(
             }
         });
     }
-    let ctx = view::Ctx {
-        anim: anim.clone(),
-        rpc: Some(state.rpc.clone()),
-        transcript: transcript.clone(),
-        tasks: state.tasks.clone(),
-        toggles: Default::default(),
-    };
+    let ctx = view::Ctx::new(
+        anim.clone(),
+        Some(state.rpc.clone()),
+        transcript.clone(),
+        state.tasks.clone(),
+    );
     // The transcript watch; a desync remounts it for a fresh snapshot.
     let resync = cx.state(0_u32);
     let subscription = {
@@ -902,9 +565,6 @@ fn chat_view(
         /// The working indicator and the bottom padding.
         Tail,
     }
-    // Resting at the end, the list stays there as rows are measured and
-    // messages arrive.
-    let heights = VariableHeights::new(&cx.runtime(), 0, 80.).anchor_end();
     let rows = {
         let blocks = blocks.clone();
         move || {
@@ -916,10 +576,10 @@ fn chat_view(
     };
     // Heights of rows not yet mounted: text measured exactly, as laid out.
     let estimate = {
-        let (ctx, measure) = (ctx.clone(), cx.text_measure());
+        let (ctx, measure, stack) = (ctx.clone(), cx.text_measure(), stack.clone());
         move |rows: &[Row], index: usize| match &rows[index] {
             Row::Head => 26.,
-            Row::Tail => 48.,
+            Row::Tail => stack.with_untracked(|h| *h) + 32.,
             Row::Block(block) => {
                 let previous = match index.checked_sub(1).map(|p| &rows[p]) {
                     Some(Row::Block(previous)) => Some(previous),
@@ -931,7 +591,9 @@ fn chat_view(
     };
     let build = {
         let (ctx, previous, anim) = (ctx.clone(), blocks.clone(), anim.clone());
-        let (loaded, working) = (loaded.clone(), working.clone());
+        let (loaded, working, stack) = (loaded.clone(), working.clone(), stack.clone());
+        // Zeron picks the working word from the chat id.
+        let seed = tools::flavour_seed(&id);
         move |_, row: Row, cx: &mut Context| {
             let content = match row {
                 Row::Head => {
@@ -963,11 +625,14 @@ fn chat_view(
                     });
                     view::block(cx, &ctx, &block, before)
                 }
+                // The working trailer, then clearance for the bottom stack
+                // and its fade (Zeron: clearance + fade band + 8).
                 Row::Tail => {
+                    let stack = stack.clone();
                     column()
                         .w_full()
-                        .pb(48.)
-                        .child(view::trailer(cx, &anim, working.clone()))
+                        .reactive_style(move || Styles::new().pb(stack.get() + 32.))
+                        .child(tools::trailer(cx, &anim, working.clone(), seed))
                 }
             };
             column()
@@ -976,80 +641,139 @@ fn chat_view(
                 .child(column().w_full().max_w(832.).px(48.).child(content))
         }
     };
-    // Zeron's column: 736 wide with 48 px gutters, first row 26 px under
-    // the titlebar. The viewport is an isolated layer whose edges fade, so
-    // text dissolves under the titlebar and just above the composer.
-    // The viewport is the flex item itself: percentage heights inside a
-    // grown item do not resolve, so the list grows into the space instead.
-    // The composer overlaps its last 28 px, where its bottom fade runs.
-    let scroller = measured_rows(page.clone(), heights, 2, rows, estimate, build)
-        // Zeron's per-pixel edge mask: content dissolves over 28 px under the
-        // titlebar and into the composer, with no layer to repaint.
-        .fade_edges(28., 32.)
-        .scrollbar(true)
-        .w_full()
-        .grow()
-        .min_h(0.);
-    let jump = {
-        let (follow, pinned) = (follow.clone(), follow.pinned.clone());
-        row()
-            .h(30.)
-            .px(12.)
-            .gap(6.)
-            .items_center()
-            .rounded(15.)
-            .bg(Color(40, 44, 56, 235))
-            .border(1.)
-            .border_color(white(24))
-            .cursor(Cursor::Pointer)
-            .text_size(12.)
-            .text_color(TEXT)
-            .hover(|s| s.bg(Color(52, 57, 72, 245)))
-            .reactive_style(move || {
-                if pinned.get() {
-                    Styles::new().hidden()
-                } else {
-                    Styles::new().flex()
-                }
-            })
-            .on_click(move || {
-                follow.pin();
-                follow.schedule();
-            })
-            .child(text("↓"))
-            .child(text("Latest"))
+    // Zeron's column: 736 wide with 48 px gutters, the first row 64 px from
+    // the window top (38 of titlebar, then 26). The scroller runs on under
+    // the bottom stack: text dissolves over 24 px under the titlebar and
+    // across the composer (Zeron's `edge_faded`, squared ramp, per pixel),
+    // so it reads through the frosted pill.
+    let scroller = {
+        let stack = stack.clone();
+        measured_rows(page.clone(), heights, 2, rows, estimate, build)
+            .scrollbar(true)
+            .w_full()
+            .h_full()
+            .reactive_style(move || Styles::new().fade_edges(24., (stack.get() - 24.).max(1.)))
     };
-    let viewport = column()
+    // Reports the scroller's height for the distance from the bottom.
+    let probe = {
+        let viewport = follow.viewport.clone();
+        canvas(move |(_, height)| {
+            viewport.set(height);
+            zgui::canvas::Canvas::new()
+        })
+        .absolute()
+        .left(0.)
+        .top(0.)
+        .w_full()
+        .h_full()
+    };
+    let (dock, pill) = composer::dock(cx, state, &id, working, chat.clone());
+    {
+        // Status strip plus the composer dock, following the pill's morph.
+        let stack = stack.clone();
+        let effect = cx.runtime().effect(move || {
+            stack.set(24. + composer::stack_height(pill.get()));
+        });
+        cx.retain(effect);
+    }
+    let bottom = column()
+        .absolute()
+        .left(0.)
+        .bottom(0.)
+        .w_full()
+        .items_center()
+        // Zeron's status strip: empty unless a send is in flight.
+        .child(div().w_full().h(24.).shrink_0())
+        .child(
+            overlay()
+                .w_full()
+                .max_w(COMPOSER_WIDTH)
+                .child(dock)
+                .child(jump_pill(cx, &anim, &follow)),
+        );
+    let viewport = overlay()
         .w_full()
         .grow()
         .min_h(0.)
         .child(scroller)
-        // "Latest", floating above the composer while scrolled up.
-        .child(
-            row()
-                .absolute()
-                .left(0.)
-                .bottom(40.)
-                .w_full()
-                .justify_center()
-                .child(jump),
-        );
-    let bottom = column()
-        .w_full()
-        .shrink_0()
-        .mt(-28.)
-        .items_center()
-        .px(16.)
-        .pb(8.)
-        .child(composer(cx, state, &id, working))
-        .child(footer(chat.clone()));
+        .child(probe)
+        .child(bottom);
     column()
         .w_full()
         .h_full()
         .child(subscription)
         .child(titlebar(chat.clone(), window))
         .child(viewport)
-        .child(bottom)
+}
+
+/// The docked composer's width: the 736 column and 16 px each side.
+const COMPOSER_WIDTH: f32 = 768.;
+/// The bottom stack before the composer reports: status strip 24, a
+/// single-line pill and its dock.
+const STACK: f32 = 24. + 49. + 40.;
+
+/// Zeron's "Scroll to bottom" pill: 6 px above the composer, frosted (radius
+/// 15, blur 16) over the popup tint with a hairline border and a hover wash.
+/// It enters with `dialog_in` (180 ms, rising 2 px) and leaves at once.
+fn jump_pill(cx: &mut Context, anim: &Anim, follow: &Rc<Follow>) -> View {
+    let hover = theme::Hover::new(cx, anim);
+    let entered = cx.state(theme::Tween::settled(0.));
+    {
+        let (shown, entered, anim) = (follow.shown.clone(), entered.clone(), anim.clone());
+        let effect = cx.runtime().effect(move || {
+            if shown.get() {
+                anim.retarget(&entered, 1., theme::DIALOG_IN);
+            } else {
+                entered.set(theme::Tween::settled(0.));
+            }
+        });
+        cx.retain(effect);
+    }
+    let pill = {
+        let (follow, hover2, anim) = (follow.clone(), hover.clone(), anim.clone());
+        row()
+            .h(30.)
+            .pl(11.)
+            .pr(13.)
+            .gap(6.)
+            .items_center()
+            .rounded(15.)
+            .blur(16.)
+            .border(1.)
+            .border_color(theme::BORDER)
+            .cursor(Cursor::Pointer)
+            .text_size(13.)
+            .reactive_style(move || {
+                let t = anim.tween(&entered, theme::DIALOG_IN);
+                Styles::new()
+                    .bg(theme::mix(
+                        theme::SURFACE_TINT,
+                        theme::GLASS_HOVER,
+                        hover2.get(),
+                    ))
+                    .opacity(t)
+                    .translate(0., 2. * (1. - t))
+            })
+            .on_click(move || follow.jump())
+            .child(text("↓").text_color(theme::TEXT_MUTED))
+            .child(text("Scroll to bottom").text_color(TEXT))
+    };
+    let shown = follow.shown.clone();
+    row()
+        .absolute()
+        .left(0.)
+        .top(-36.)
+        .w_full()
+        .pr(10.)
+        .justify_center()
+        .reactive_style(move || {
+            if shown.get() {
+                Styles::new().flex()
+            } else {
+                Styles::new().hidden()
+            }
+        })
+        .child(hover.track(pill))
 }
 
 /// A reset holding all but the last `tail` entries, then those entries
@@ -1106,12 +830,21 @@ fn replay_schedule(entries: &[Value], tail: usize) -> (Value, Vec<(u64, Value)>)
     (reset, schedule)
 }
 
-/// Zeron's titlebar row: 38 px, content centred with the traffic lights.
+/// Zeron's session title row (`render_session_title_bar`): 38 px with the
+/// row centred on the traffic lights, 16 px in from the sidebar, the
+/// harness mark and the session title. The rest of the strip drags.
 fn titlebar(
     chat: impl Fn() -> Option<ChatRow> + Clone + 'static,
     window: zgui_desktop::WindowHandle,
 ) -> View {
-    let (title_of, meta_of) = (chat.clone(), chat);
+    let (title_of, harness_of) = (chat.clone(), chat);
+    let mark = switch(
+        move || harness_of().map(|c| c.harness()),
+        |harness, _| match harness {
+            Some(harness) => theme::harness_icon(&harness, 14., theme::TEXT_MUTED),
+            None => div(),
+        },
+    );
     drag_region(
         row()
             .w_full()
@@ -1121,100 +854,114 @@ fn titlebar(
             .gap(6.)
             .shrink_0()
             .items_center()
-            .child(icon("bot", 14., MUTED))
+            .child(mark)
             .child(
                 text_signal(move || title_of().map(|c| c.title).unwrap_or_default())
                     .truncate()
                     .min_w(0.)
                     .text_size(12.)
                     .font_weight(500)
-                    .text_color(white(216)),
-            )
-            .child(
-                text_signal(move || meta_of().map(|c| c.project).unwrap_or_default())
-                    .shrink_0()
-                    .text_size(12.)
-                    .text_color(white(88)),
+                    .text_color(theme::alpha(TEXT, 0.85)),
             ),
         window,
     )
 }
 
-/// Under the composer: checkout and branch, as in Zeron.
-fn footer(chat: impl Fn() -> Option<ChatRow> + Clone + 'static) -> View {
-    let label = |glyph: &'static str, value: View| {
-        row()
-            .h(20.)
-            .px(8.)
-            .gap(6.)
-            .items_center()
-            .text_size(12.)
-            .font_weight(500)
-            .text_color(white(100))
-            .child(text(glyph).text_size(11.))
-            .child(value)
-    };
-    row()
-        .w_full()
-        .max_w(736.)
-        .h(24.)
-        .mt(2.)
-        .px(10.)
-        .gap(4.)
-        .items_center()
-        .child(label("▢", text("Local checkout")))
-        .child(label(
-            "⎇",
-            text_signal(move || {
-                chat()
-                    .and_then(|c| c.branch)
-                    .unwrap_or_else(|| "No ref".into())
-            }),
-        ))
-}
-
-/// Keeps the newest content in view while the reader is at the bottom.
-/// Jumps wait a frame: scroll offsets clamp to the laid-out content, so a
-/// jump made before new content is laid out would stop short.
+/// Zeron's stick-to-bottom (`transcript.rs`): pinned readers follow new
+/// content; scrolling away from the bottom escapes, and scrolling back
+/// within 70 px (or to it) pins again. The jump pill shows past 320 px and
+/// hides at the bottom. Jumps wait a frame: offsets clamp to laid-out
+/// content, so a jump made before new content is laid out would stop short.
 struct Follow {
     offset: Signal<f32>,
-    /// The largest offset seen, i.e. the bottom as of the last layout.
-    bottom: Cell<f32>,
+    heights: VariableHeights,
+    /// The scroller's height, reported by a probe in its overlay.
+    viewport: Signal<f32>,
     pinned: Signal<bool>,
+    /// The jump pill, with Zeron's hysteresis.
+    shown: Signal<bool>,
+    /// The last distance from the bottom, for the escape / re-pin rules.
+    previous: Cell<f32>,
     scheduled: Cell<bool>,
+    gliding: Cell<bool>,
     tasks: zgui::compose::Tasks,
     frames: zgui::frame::FrameClock,
 }
 
+/// Zeron's `STICK_THRESHOLD_PX`, `SCROLL_BUTTON_THRESHOLD_PX`, `AT_BOTTOM_PX`.
+const STICK: f32 = 70.;
+const JUMP_SHOWS: f32 = 320.;
+const AT_BOTTOM: f32 = 2.;
+
 impl Follow {
-    fn new(cx: &mut Context, offset: Signal<f32>) -> Rc<Self> {
+    fn new(cx: &mut Context, offset: Signal<f32>, heights: VariableHeights) -> Rc<Self> {
         let follow = Rc::new(Self {
             offset: offset.clone(),
-            bottom: Cell::new(0.),
+            heights,
+            viewport: cx.state(0.),
             pinned: cx.state(true),
+            shown: cx.state(false),
+            previous: Cell::new(0.),
             scheduled: Cell::new(false),
+            gliding: Cell::new(false),
             tasks: cx.tasks(),
             frames: cx.frames(),
         });
-        // Scrolling well above the bottom unpins; scrolling back pins again.
+        // Reader scrolls (offset changes) escape or re-pin; growth alone
+        // never does, so the content is read untracked.
         let weak = Rc::downgrade(&follow);
+        let runtime = cx.runtime();
         let effect = cx.runtime().effect(move || {
             let current = offset.get();
             // The jump's sentinel, before layout clamps it to the bottom.
             if current >= 1e8 {
                 return;
             }
-            if let Some(follow) = weak.upgrade() {
-                follow.bottom.set(follow.bottom.get().max(current));
-                follow.pinned.set(current + 80. >= follow.bottom.get());
+            let Some(follow) = weak.upgrade() else {
+                return;
+            };
+            let distance = runtime.untracked(|| follow.distance());
+            let previous = follow.previous.replace(distance);
+            if follow.gliding.get() {
+                return;
             }
+            if distance > previous + 1. && distance > AT_BOTTOM {
+                follow.pinned.set(false);
+            } else if distance <= AT_BOTTOM || (distance <= STICK && distance < previous) {
+                follow.pinned.set(true);
+            }
+        });
+        cx.retain(effect);
+        let weak = Rc::downgrade(&follow);
+        let effect = cx.runtime().effect(move || {
+            let Some(follow) = weak.upgrade() else {
+                return;
+            };
+            follow.offset.get();
+            let distance = follow.distance();
+            let pinned = follow.pinned.get();
+            let was = follow.shown.with_untracked(|s| *s);
+            let show = !pinned
+                && if was {
+                    distance > AT_BOTTOM
+                } else {
+                    distance > JUMP_SHOWS
+                };
+            follow.shown.set(show);
         });
         cx.retain(effect);
         follow
     }
+    /// Pixels between the viewport's bottom and the content's.
+    fn distance(&self) -> f32 {
+        let offset = self.offset.get();
+        if offset >= 1e8 {
+            return 0.;
+        }
+        (self.heights.content_height() - self.viewport.get() - offset).max(0.)
+    }
     fn pin(&self) {
         self.pinned.set(true);
-        self.bottom.set(0.);
     }
     /// After the next layout, jump to the bottom if pinned.
     fn schedule(self: &Rc<Self>) {
@@ -1225,532 +972,55 @@ impl Follow {
         self.tasks.spawn(async move {
             follow.frames.next().await;
             follow.scheduled.set(false);
-            if follow.pinned.with_untracked(|p| *p) {
-                follow.bottom.set(0.);
+            if follow.pinned.with_untracked(|p| *p) && !follow.gliding.get() {
                 follow.offset.set(1e9);
             }
         });
     }
-}
-
-// Composer -------------------------------------------------------------------
-
-fn composer(
-    cx: &mut Context,
-    state: &App,
-    id: &str,
-    working: impl Fn() -> bool + Clone + 'static,
-) -> View {
-    let draft = cx.state(String::new());
-    let sending = cx.state(false);
-    let notice = cx.state(None::<String>);
-    let send = {
-        let (state, id, draft, sending, notice, working) = (
-            state.clone(),
-            id.to_owned(),
-            draft.clone(),
-            sending.clone(),
-            notice.clone(),
-            working.clone(),
-        );
-        let tasks = cx.tasks();
-        Rc::new(move || {
-            let prompt = draft.with_untracked(|d| d.trim().to_owned());
-            if prompt.is_empty() || sending.with_untracked(|s| *s) {
-                return;
-            }
-            let Some(chat) = state
-                .rows
-                .with_untracked(|rows| rows.iter().find(|r| r.id == id).cloned())
-            else {
-                return;
-            };
-            let busy = working();
-            let (rpc, draft, sending, notice) = (
-                state.rpc.clone(),
-                draft.clone(),
-                sending.clone(),
-                notice.clone(),
-            );
-            sending.set(true);
-            tasks.spawn(async move {
-                let result = if busy {
-                    // Mid-turn: queue it to run when the turn ends, as Zeron does.
-                    rpc.call(
-                        "QueueMessage",
-                        json!({ "chatId": chat.id, "text": prompt, "holdForTurnEnd": true }),
-                    )
-                    .await
-                } else {
-                    let config = &chat.config;
-                    rpc.call(
-                        "QueueCommand",
-                        json!({ "chatId": chat.id, "command": {
-                            "kind": "run",
-                            "messageId": uuid::Uuid::new_v4().to_string(),
-                            "request": {
-                                "prompt": prompt,
-                                "harness": chat.harness(),
-                                "model": config.get("model").cloned().unwrap_or(Value::Null),
-                                "reasoning": config.get("reasoning").cloned().unwrap_or(Value::Null),
-                                "modelOptions": config.get("modelOptions").cloned().unwrap_or_else(|| json!({})),
-                                "cwd": chat.cwd.clone().unwrap_or_else(|| "~".into()),
-                                "sandbox": config.get("sandbox").cloned().unwrap_or_else(|| json!("workspace-write")),
-                                "autoApprove": false,
-                                "resume": null,
-                            }
-                        }}),
-                    )
-                    .await
-                };
-                sending.set(false);
-                match result {
-                    Ok(_) => {
-                        draft.set(String::new());
-                        notice.set(if busy {
-                            Some("Queued for after this turn".into())
-                        } else {
-                            None
-                        });
-                    }
-                    Err(error) => {
-                        notice.set(Some(format!("Couldn't send: {error}")));
-                    }
-                }
-            });
-        })
-    };
-    let interrupt = {
-        let (rpc, id) = (state.rpc.clone(), id.to_owned());
-        let tasks = cx.tasks();
-        move || {
-            let (rpc, id) = (rpc.clone(), id.clone());
-            tasks.spawn(async move {
-                let _ = rpc
-                    .call(
-                        "QueueCommand",
-                        json!({ "chatId": id, "command": { "kind": "interrupt" } }),
-                    )
-                    .await;
-            });
+    /// The jump pill: pin, teleport to within 2.5 viewports, then Zeron's
+    /// critically damped `StickSpring` the rest of the way (it never
+    /// overshoots), landing glued to the end.
+    fn jump(self: &Rc<Self>) {
+        self.pinned.set(true);
+        if self.gliding.replace(true) {
+            return;
         }
-    };
-    // Test hook: ZERON_SEND=<text> sends it through this composer once.
-    if let Ok(text_) = std::env::var("ZERON_SEND") {
-        static SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !SENT.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            let (draft, send) = (draft.clone(), send.clone());
-            cx.tasks().spawn(async move {
-                sleep(Duration::from_millis(2500)).await;
-                println!("ZERON_SEND {text_:?}");
-                draft.set(text_);
-                send();
-            });
-        }
-    }
-    let placeholder = {
-        let draft = draft.clone();
-        text("Do anything…")
-            .text_size(14.)
-            .line_height(22.75)
-            .text_color(FAINT)
-            .reactive_style(move || {
-                if draft.with(String::is_empty) {
-                    Styles::new().flex()
-                } else {
-                    Styles::new().hidden()
+        let follow = self.clone();
+        self.tasks.spawn(async move {
+            let mut velocity = 0_f32;
+            let mut last = None::<std::time::Instant>;
+            loop {
+                let frame = follow.frames.next().await;
+                let (content, viewport, mut position) = (
+                    follow.heights.content_height(),
+                    follow.viewport.with_untracked(|v| *v),
+                    follow.offset.with_untracked(|o| *o),
+                );
+                let target = (content - viewport).max(0.);
+                position = position.min(target);
+                if target - position > 2.5 * viewport {
+                    position = target - 2.5 * viewport;
                 }
-            })
-    };
-    let input = {
-        let (send, lines) = (send.clone(), draft.clone());
-        text_area("Message", draft.clone())
-            .w_full()
-            .text_wrap(true)
-            .text_size(14.)
-            .line_height(22.75)
-            .bg(white(0))
-            .border(0.)
-            .p(0.)
-            .focus(|s| s)
-            // Zeron's text area: 76 px empty, growing with its lines to 260.
-            .reactive_style(move || {
-                let count = lines.with(|d| d.lines().count() + usize::from(d.ends_with('\n')));
-                Styles::new().h((count as f32 * 22.75).clamp(76., 260.))
-            })
-            .on_event(move |event| {
-                if event.phase == EventPhase::Capture
-                    && matches!(
-                        event.event,
-                        InputEvent::KeyDown { key: Key::Enter, modifiers, .. } if !modifiers.shift
-                    )
-                {
-                    event.prevent_default();
-                    event.stop_propagation();
-                    send();
+                let frames = last.map_or(1., |last: std::time::Instant| {
+                    (frame.time.saturating_duration_since(last).as_secs_f32() * 60.).min(8.)
+                });
+                last = Some(frame.time);
+                let mut left = frames;
+                while left > 0. {
+                    let h = left.min(1.);
+                    let diff = (target - position).max(0.);
+                    velocity += h * ((0.7 * velocity + 0.05 * diff) / 1.25 - velocity);
+                    position = (position + velocity * h).min(target);
+                    left -= h;
                 }
-            })
-    };
-    // A 28 px light circle: an arrow to send (35% when empty), a rounded
-    // square to stop a running turn.
-    let action = {
-        let (working2, working3, draft) = (working.clone(), working.clone(), draft.clone());
-        let arrow = text("↑")
-            .text_size(14.)
-            .font_weight(700)
-            .text_color(Color(6, 6, 6, 255))
-            .reactive_style(move || {
-                if working2() {
-                    Styles::new().hidden()
-                } else {
-                    Styles::new().flex()
+                if target - position <= 0.5 {
+                    follow.gliding.set(false);
+                    follow.previous.set(0.);
+                    follow.offset.set(1e9);
+                    break;
                 }
-            });
-        let square = div()
-            .size(11., 11.)
-            .rounded(3.)
-            .bg(Color(6, 6, 6, 255))
-            .reactive_style(move || {
-                if working3() {
-                    Styles::new().flex()
-                } else {
-                    Styles::new().hidden()
-                }
-            });
-        let (busy, click) = (working.clone(), working.clone());
-        button()
-            .size(28., 28.)
-            .rounded(14.)
-            .items_center()
-            .justify_center()
-            .shrink_0()
-            .bg(Color(232, 232, 234, 255))
-            .focus(|s| s)
-            .hover(|s| s.opacity(0.85))
-            .reactive_style(move || {
-                let empty = draft.with(|d| d.trim().is_empty());
-                Styles::new().opacity(if busy() || !empty { 1. } else { 0.35 })
-            })
-            .child(arrow)
-            .child(square)
-            .on_click(move || {
-                if click() {
-                    interrupt();
-                } else {
-                    send();
-                }
-            })
-    };
-    let hint = text_signal(move || notice.get().unwrap_or_default())
-        .text_size(11.5)
-        .text_color(FAINT);
-    // Zeron's frosted pill: 736 wide, radius 26, a 16 px backdrop blur
-    // over a faint fill, and a cool hairline border.
-    column()
-        .w_full()
-        .max_w(736.)
-        .rounded(26.)
-        .blur(16.)
-        .bg(Color(8, 8, 10, 70))
-        .border(1.)
-        .border_color(Color(189, 199, 209, 30))
-        .child(
-            overlay()
-                .w_full()
-                .px(16.)
-                .pt(16.)
-                .pb(4.)
-                .child(placeholder)
-                .child(input),
-        )
-        .child(
-            row()
-                .w_full()
-                .h(42.)
-                .pt(2.)
-                .pb(8.)
-                .px(12.)
-                .items_center()
-                .gap(2.)
-                .child(pickers_for(state, id))
-                .child(hint.w(0.).grow().truncate().pl(8.))
-                .child(action.ml(8.)),
-        )
-}
-
-/// Set fields of the chat's config. `setChatConfig` replaces the whole
-/// config, so the rest is copied from the chat row.
-fn set_config(state: &App, id: &str, chat: &ChatRow, changes: &[(&str, Value)]) {
-    let mut config = chat.config.clone();
-    if !config.is_object() {
-        config =
-            json!({ "harness": chat.harness(), "modelOptions": {}, "sandbox": "workspace-write" });
-    }
-    for (key, value) in changes {
-        config[*key] = value.clone();
-    }
-    let (rpc, id) = (state.rpc.clone(), id.to_owned());
-    state.tasks.spawn(async move {
-        if let Err(error) = rpc
-            .call(
-                "Mutate",
-                json!({ "op": "setChatConfig", "chatId": id, "config": config }),
-            )
-            .await
-        {
-            eprintln!("zeron: updating the chat config failed: {error}");
-        }
-    });
-}
-
-fn models_for(state: &App, cx: &mut Context, harness: &str) -> Models {
-    state
-        .models
-        .borrow_mut()
-        .entry(harness.to_owned())
-        .or_insert_with(|| {
-            let models = cx.state(Vec::new());
-            let (rpc, out, harness) = (state.rpc.clone(), models.clone(), harness.to_owned());
-            state.tasks.spawn(async move {
-                if let Ok(list) = rpc
-                    .call("ListModels", json!({ "harness": harness, "force": false }))
-                    .await
-                {
-                    let list = list
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|m| {
-                            let id = m.get("id")?.as_str()?.to_owned();
-                            let label = m
-                                .get("label")
-                                .and_then(Value::as_str)
-                                .unwrap_or(&id)
-                                .to_owned();
-                            let levels = m
-                                .get("reasoningLevels")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|l| l.as_str().map(str::to_owned))
-                                .collect();
-                            Some((id, label, levels))
-                        })
-                        .collect();
-                    out.set(list);
-                }
-            });
-            models
-        })
-        .clone()
-}
-
-/// Model and reasoning pickers, rebuilt when the chat's harness changes: it
-/// decides the models offered.
-fn pickers_for(state: &App, id: &str) -> View {
-    let harness = {
-        let (rows, id) = (state.rows.clone(), id.to_owned());
-        move || rows.with(|rows| rows.iter().find(|r| r.id == id).map(ChatRow::harness))
-    };
-    let (state, id) = (state.clone(), id.to_owned());
-    switch(harness, move |harness, cx| {
-        pickers(
-            cx,
-            &state,
-            &id,
-            harness.unwrap_or_else(|| "claude-code".into()),
-        )
-    })
-}
-
-fn title_case(value: &str) -> String {
-    let mut chars = value.chars();
-    chars
-        .next()
-        .map(|c| c.to_uppercase().chain(chars).collect())
-        .unwrap_or_default()
-}
-
-/// Zeron's composer chip: 32 px, radius 8, a hover wash.
-fn pill(label: View, open: Signal<bool>) -> View {
-    button()
-        .h(32.)
-        .px(8.)
-        .gap(6.)
-        .rounded(8.)
-        .items_center()
-        .shrink_0()
-        .bg(white(0))
-        .border(0.)
-        .hover(|s| s.bg(white(28)))
-        .focus(|s| s)
-        .text_color(white(220))
-        .child(label)
-        .child(svg("more", Arc::new(icon_data("chevron").tinted(FAINT))).size(10., 10.))
-        .on_click(move || {
-            open.set(true);
-        })
-}
-
-fn menu_entry(label: String, current: bool, action: impl FnMut() + 'static) -> View {
-    menu_item(label)
-        .h(30.)
-        .px(10.)
-        .rounded(7.)
-        .items_center()
-        .text_size(12.5)
-        .text_color(if current { TEXT } else { white(205) })
-        .bg(white(if current { 20 } else { 0 }))
-        .focus(|s| s.bg(white(26)))
-        .hover(|s| s.bg(white(18)))
-        .on_click(action)
-}
-
-fn menu_panel(view: View, width: f32, entries: usize) -> View {
-    view.w(width)
-        .h(entries.clamp(1, 12) as f32 * 32. + 12.)
-        .p(6.)
-        .gap(2.)
-        .rounded(12.)
-        .bg(Color(30, 33, 42, 248))
-        .border(1.)
-        .border_color(white(24))
-}
-
-fn pickers(cx: &mut Context, state: &App, id: &str, harness: String) -> View {
-    let models = models_for(state, cx, &harness);
-    let chat = {
-        let (rows, id) = (state.rows.clone(), id.to_owned());
-        move || rows.with(|rows| rows.iter().find(|r| r.id == id).cloned())
-    };
-    // Test hook: ZERON_MODEL=<model id> picks it once the list loads.
-    if let Ok(wanted) = std::env::var("ZERON_MODEL") {
-        let (state2, id2, chat, models) =
-            (state.clone(), id.to_owned(), chat.clone(), models.clone());
-        let done = Cell::new(false);
-        let effect = cx.runtime().effect(move || {
-            let known = models.with(|m| m.iter().any(|(model, _, _)| *model == wanted));
-            if known
-                && !done.replace(true)
-                && let Some(chat) = chat()
-            {
-                println!("ZERON_MODEL switching {} to {wanted}", chat.id);
-                set_config(&state2, &id2, &chat, &[("model", json!(wanted))]);
+                follow.offset.set(position);
             }
         });
-        cx.retain(effect);
     }
-    let model_label = {
-        let (chat, models, harness) = (chat.clone(), models.clone(), harness.clone());
-        move || match chat().and_then(|c| c.model()) {
-            Some(model) => models.with(|m| {
-                m.iter()
-                    .find(|(id, _, _)| *id == model)
-                    .map_or(model.clone(), |(_, label, _)| label.clone())
-            }),
-            None => format!("{} default", title_case(&harness.replace('-', " "))),
-        }
-    };
-    let levels = {
-        let (chat, models) = (chat.clone(), models.clone());
-        move || {
-            let model = chat().and_then(|c| c.model());
-            models.with(|m| {
-                m.iter()
-                    .find(|(id, _, _)| Some(id) == model.as_ref())
-                    .or_else(|| m.first())
-                    .map(|(_, _, levels)| levels.clone())
-                    .unwrap_or_default()
-            })
-        }
-    };
-    let reasoning_label = {
-        let chat = chat.clone();
-        move || {
-            chat()
-                .and_then(|c| {
-                    c.config
-                        .get("reasoning")
-                        .and_then(Value::as_str)
-                        .map(title_case)
-                })
-                .unwrap_or_else(|| "Default".into())
-        }
-    };
-    let model_open = cx.state(false);
-    let model_picker = {
-        let (state, id, chat) = (state.clone(), id.to_owned(), chat.clone());
-        switch(
-            {
-                let models = models.clone();
-                move || models.get()
-            },
-            move |list, _| {
-                let current = chat().and_then(|c| c.model());
-                let count = list.len();
-                let entries: Vec<View> = list
-                    .into_iter()
-                    .map(|(model, label, _)| {
-                        let (state, id, chat) = (state.clone(), id.clone(), chat.clone());
-                        let is_current = current.as_deref() == Some(model.as_str());
-                        menu_entry(label, is_current, move || {
-                            if let Some(chat) = chat() {
-                                set_config(&state, &id, &chat, &[("model", json!(model))]);
-                            }
-                        })
-                    })
-                    .collect();
-                let label = model_label.clone();
-                let anchor = pill(
-                    text_signal(label).text_size(12.).font_weight(560),
-                    model_open.clone(),
-                );
-                menu_panel(menu("Model", model_open.clone(), anchor), 260., count).children(entries)
-            },
-        )
-    };
-    let reasoning_open = cx.state(false);
-    let reasoning_picker = {
-        let (state, id, chat) = (state.clone(), id.to_owned(), chat.clone());
-        switch(levels, move |levels, _| {
-            if levels.is_empty() {
-                return div();
-            }
-            let current = chat().and_then(|c| {
-                c.config
-                    .get("reasoning")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            });
-            let count = levels.len();
-            let entries: Vec<View> = levels
-                .into_iter()
-                .map(|level| {
-                    let (state, id, chat) = (state.clone(), id.clone(), chat.clone());
-                    let is_current = current.as_deref() == Some(level.as_str());
-                    menu_entry(title_case(&level), is_current, move || {
-                        if let Some(chat) = chat() {
-                            set_config(&state, &id, &chat, &[("reasoning", json!(level))]);
-                        }
-                    })
-                })
-                .collect();
-            let label = reasoning_label.clone();
-            let anchor = pill(
-                text_signal(label).text_size(12.).text_color(MUTED),
-                reasoning_open.clone(),
-            );
-            menu_panel(
-                menu("Reasoning", reasoning_open.clone(), anchor),
-                180.,
-                count,
-            )
-            .children(entries)
-        })
-    };
-    row()
-        .gap(6.)
-        .items_center()
-        .child(model_picker)
-        .child(reasoning_picker)
 }
