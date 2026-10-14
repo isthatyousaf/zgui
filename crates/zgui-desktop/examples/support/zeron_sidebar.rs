@@ -614,6 +614,7 @@ fn session_list(
         scroll(offset)
             .w_full()
             .grow()
+            .flex_shrink(1.)
             .min_h(0.)
             .reactive_style(move || {
                 let n = count();
@@ -647,6 +648,7 @@ fn session_list(
     column()
         .w_full()
         .grow()
+        .flex_shrink(1.)
         .min_h(0.)
         .child(probe)
         .child(scroller)

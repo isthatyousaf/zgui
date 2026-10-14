@@ -200,6 +200,7 @@ fn preview(cx: &mut Context, path: &str) -> View {
                 .scrollbar(true)
                 .w_full()
                 .grow()
+                .flex_shrink(1.)
                 .min_h(0.)
                 .child(
                     column().w_full().items_center().child(
@@ -373,7 +374,10 @@ fn app(cx: &mut Context, rpc: Rpc, window: zgui_desktop::WindowHandle) -> View {
         .text_size(14.)
         .text_color(TEXT)
         .child(sidebar::sidebar(cx, &state, window))
-        .child(column().grow().min_w(0.).child(content))
+        // Shrinkable (zgui's flex items keep their content size by default):
+        // the transcript's rows, laid out at the last width, would otherwise
+        // hold the pane at it when the window narrows.
+        .child(column().grow().flex_shrink(1.).min_w(0.).child(content))
 }
 
 // Chat -----------------------------------------------------------------------
@@ -646,13 +650,17 @@ fn chat_view(
     // the bottom stack: text dissolves over 24 px under the titlebar and
     // across the composer (Zeron's `edge_faded`, squared ramp, per pixel),
     // so it reads through the frosted pill.
+    // The transcript's scrollbar, drawn over everything at the end (see
+    // `viewport`), reads where the list is from these.
+    let (bar_offset, bar_heights) = (page.clone(), heights.clone());
     let scroller = {
         let stack = stack.clone();
         measured_rows(page.clone(), heights, 2, rows, estimate, build)
-            .scrollbar(true)
             .w_full()
             .h_full()
-            .reactive_style(move || Styles::new().fade_edges(24., (stack.get() - 24.).max(1.)))
+            // Faded out over the soft edge (`edge`), down to the window's
+            // bottom, as its blur grows.
+            .reactive_style(move || Styles::new().fade_edges(24., stack.get() - 24. + EDGE_LEAD))
     };
     // Reports the scroller's height for the distance from the bottom.
     let probe = {
@@ -691,13 +699,50 @@ fn chat_view(
                 .child(dock)
                 .child(jump_pill(cx, &anim, &follow)),
         );
+    // A soft scroll edge under the bottom stack: from EDGE_LEAD above the
+    // composer down to the window's bottom, the transcript's blur grows from
+    // nothing as the text fades out (`scroller`), so it dissolves gradually
+    // on its way under the composer, as Tern's does; no tint, so no band
+    // shows. The pills keep frosts of their own.
+    let edge = {
+        let reach = stack.clone();
+        // Its fade spans the whole band; the other edges overhang the chat
+        // pane by as much, clipped, so only the top's shows.
+        let band = div().absolute().top(0.).blur(EDGE_BLUR).reactive_style(move || {
+            let ramp = reach.get() - 24. + EDGE_LEAD;
+            Styles::new()
+                .left(-ramp)
+                .right(-ramp)
+                .bottom(-ramp)
+                .edge_fade(ramp)
+        });
+        let stack = stack.clone();
+        div()
+            .absolute()
+            .left(0.)
+            .right(0.)
+            .bottom(0.)
+            .overflow_hidden()
+            .reactive_style(move || Styles::new().h(stack.get() - 24. + EDGE_LEAD))
+            .child(band)
+    };
+    // Last, so the frost and the pills never cover it.
+    let bar = scrollbar(bar_offset, move || bar_heights.content_height())
+        .absolute()
+        .top(0.)
+        .right(2.)
+        .bottom(0.)
+        .w(8.);
     let viewport = overlay()
         .w_full()
         .grow()
+        .flex_shrink(1.)
         .min_h(0.)
         .child(scroller)
         .child(probe)
-        .child(bottom);
+        .child(edge)
+        .child(bottom)
+        .child(bar);
     column()
         .w_full()
         .h_full()
@@ -706,6 +751,10 @@ fn chat_view(
         .child(viewport)
 }
 
+/// The soft scroll edge's blur, reached at the window's bottom, and how far
+/// above the composer's top it starts.
+const EDGE_BLUR: f32 = 16.;
+const EDGE_LEAD: f32 = 24.;
 /// The docked composer's width: the 736 column and 16 px each side.
 const COMPOSER_WIDTH: f32 = 768.;
 /// The bottom stack before the composer reports: status strip 24, a

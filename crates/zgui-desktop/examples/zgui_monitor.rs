@@ -1820,7 +1820,9 @@ mod usage {
             // SAFETY: a valid entry and key; the result is owned (Create rule).
             let value =
                 unsafe { IORegistryEntryCreateCFProperty(entry, key.0, std::ptr::null(), 0) };
-            (!value.is_null()).then_some(Self(value))
+            // Lazily: an eager `Self(value)` would be dropped, releasing
+            // null, when the entry lacks the property.
+            (!value.is_null()).then(|| Self(value))
         }
     }
     impl Drop for Property {
