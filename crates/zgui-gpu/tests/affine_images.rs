@@ -83,3 +83,38 @@ fn affine_pixels_damage_clipping_and_isolated_coordinates() {
         }
     }
 }
+
+#[test]
+fn transformed_images_fade_with_their_fade_edges_ancestor() {
+    // A rotated icon in a scroll view fading at its bottom edge fades where it
+    // is on screen, as its untransformed neighbours do.
+    let white = Arc::new(ImageData::new(1, 1, vec![255, 255, 255, 255]).unwrap());
+    let mut gpu = GpuRenderer::new(120, 120).unwrap();
+    let mut scene = Scene::new(120., 120.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    scene.append(scene.root(), NodeKind::Rect(Color(0, 0, 0, 255)), fixed(120., 120.));
+    let view = scene.append(
+        scene.root(),
+        NodeKind::Container(Layout::Overlay),
+        Style {
+            clip: true,
+            fade_edges: [0., 40.],
+            ..fixed(120., 120.)
+        },
+    );
+    let icon = scene.append(
+        view,
+        NodeKind::Image(Arc::new(white.transformed(Affine::rotation(std::f32::consts::FRAC_PI_2)))),
+        fixed(20., 20.),
+    );
+    scene.set_transform(icon, Transform { x: 10., y: 90. });
+    let plain = scene.append(view, NodeKind::Image(white), fixed(20., 20.));
+    scene.set_transform(plain, Transform { x: 60., y: 90. });
+    let report = scene.flush();
+    gpu.render(&scene, &report.damage).unwrap();
+    let pixels = gpu.readback().unwrap();
+    // 100 px down, 20 into the 40 px band: a quarter of full brightness.
+    let (rotated, upright) = (pixel(&pixels, 20, 100)[0], pixel(&pixels, 70, 100)[0]);
+    assert!(upright.abs_diff(64) <= 4, "upright {upright}");
+    assert!(rotated.abs_diff(upright) <= 2, "rotated {rotated} upright {upright}");
+}

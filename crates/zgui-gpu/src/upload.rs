@@ -1,4 +1,5 @@
-//! Per-frame vertex uploads without GPU copies on unified-memory adapters.
+//! Per-frame vertex uploads (and the backdrop filters' records after them)
+//! without GPU copies on unified-memory adapters.
 //!
 //! A copy (a Metal blit encoder) every frame costs an encoder switch and keeps
 //! the driver's blit machinery (~110 MB on Apple GPUs) resident while anything
@@ -57,7 +58,11 @@ impl MappedRing {
     /// Copy `bytes` into a CPU-written vertex buffer and return it, ready
     /// for the GPU. The second value reports a new allocation.
     pub(crate) fn write(&mut self, bytes: &[u8]) -> (wgpu::Buffer, bool) {
-        let len = bytes.len() as u64;
+        self.write_parts(&[bytes])
+    }
+    /// `write` for bytes in parts, one after another.
+    pub(crate) fn write_parts(&mut self, parts: &[&[u8]]) -> (wgpu::Buffer, bool) {
+        let len = parts.iter().map(|part| part.len() as u64).sum::<u64>();
         let mut index = self.ready(len);
         if index.is_none() {
             // Deliver callbacks for frames the GPU has already finished.
@@ -88,18 +93,30 @@ impl MappedRing {
         };
         let slot = &mut self.slots[index];
         #[cfg(target_os = "macos")]
-        // SAFETY: The slot is ready: no submission still reads it, and its
-        // memory holds `capacity` bytes, at least `len`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), slot.contents.as_ptr(), bytes.len())
-        };
+        {
+            let mut at = 0;
+            for part in parts {
+                // SAFETY: The slot is ready: no submission still reads it, and
+                // its memory holds `capacity` bytes, at least `len`.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        part.as_ptr(),
+                        slot.contents.as_ptr().add(at),
+                        part.len(),
+                    )
+                };
+                at += part.len();
+            }
+        }
         #[cfg(not(target_os = "macos"))]
         {
             if len > 0 {
-                slot.buffer
-                    .slice(..len)
-                    .get_mapped_range_mut()
-                    .copy_from_slice(bytes);
+                let mut range = slot.buffer.slice(..len).get_mapped_range_mut();
+                let mut at = 0;
+                for part in parts {
+                    range[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                }
             }
             slot.buffer.unmap();
         }
@@ -152,7 +169,7 @@ impl MappedRing {
                 &wgpu::BufferDescriptor {
                     label: Some("frame vertices"),
                     size: capacity,
-                    usage: wgpu::BufferUsages::VERTEX,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 },
             )
@@ -172,7 +189,9 @@ impl MappedRing {
             buffer: self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("mapped frame vertices"),
                 size: capacity,
-                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::VERTEX,
+                usage: wgpu::BufferUsages::MAP_WRITE
+                    | wgpu::BufferUsages::VERTEX
+                    | wgpu::BufferUsages::STORAGE,
                 mapped_at_creation: true,
             }),
             capacity,

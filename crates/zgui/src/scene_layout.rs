@@ -486,6 +486,7 @@ impl Scene {
                 mapped.size.height = dim(Length::Px(natural.1 + padding.top + padding.bottom));
             }
         }
+        let auto_width = mapped.size.width.is_auto();
         if cache.tree.style(root).expect("retained root style") != &mapped {
             cache
                 .tree
@@ -493,7 +494,7 @@ impl Scene {
                 .expect("retained root style update");
         }
         let padding = self.resolved_padding(id, constraints);
-        let child_percent_width = constraints
+        let mut child_percent_width = constraints
             .force_width
             .or(root_style.width)
             .or_else(|| percentage(root_style.width_percent, constraints.percent_width))
@@ -503,37 +504,55 @@ impl Scene {
             .or(root_style.height)
             .or_else(|| percentage(root_style.height_percent, constraints.percent_height))
             .map(|height| (height - padding.top - padding.bottom).max(0.));
-        cache
-            .tree
-            .compute_layout_with_measure(
-                root,
-                t::Size {
-                    width: available(constraints.width),
-                    height: available(constraints.height),
-                },
-                |known, space, _, context, _| {
-                    let Some(context) = context else {
-                        return t::Size::ZERO;
-                    };
-                    let child = *context;
-                    let size = self.measure(
-                        child,
-                        Constraints {
-                            width: known.width.or_else(|| bound(space.width)),
-                            height: known.height.or_else(|| bound(space.height)),
-                            percent_width: child_percent_width,
-                            percent_height: child_percent_height,
-                            force_width: known.width,
-                            force_height: known.height,
-                        },
-                    );
+        // A root of auto width learns it from its children, measured before
+        // it is known: their percentage widths resolve to nothing and their
+        // text lays out unwrapped, so the heights it keeps are one-line
+        // heights. A second pass at the width found gives them their basis:
+        // a capped bubble is as tall as the text it wraps.
+        for pass in 0..2 {
+            cache
+                .tree
+                .compute_layout_with_measure(
+                    root,
                     t::Size {
-                        width: size.0,
-                        height: size.1,
-                    }
-                },
-            )
-            .expect("retained tree is structurally valid");
+                        width: available(constraints.width),
+                        height: available(constraints.height),
+                    },
+                    |known, space, _, context, _| {
+                        let Some(context) = context else {
+                            return t::Size::ZERO;
+                        };
+                        let child = *context;
+                        let size = self.measure(
+                            child,
+                            Constraints {
+                                width: known.width.or_else(|| bound(space.width)),
+                                height: known.height.or_else(|| bound(space.height)),
+                                percent_width: child_percent_width,
+                                percent_height: child_percent_height,
+                                force_width: known.width,
+                                force_height: known.height,
+                            },
+                        );
+                        t::Size {
+                            width: size.0,
+                            height: size.1,
+                        }
+                    },
+                )
+                .expect("retained tree is structurally valid");
+            if pass == 1 || !auto_width {
+                break;
+            }
+            let found = cache.tree.layout(root).expect("computed root").size.width;
+            let mut fixed = cache.tree.style(root).expect("retained root style").clone();
+            fixed.size.width = t::Dimension::length(found);
+            cache
+                .tree
+                .set_style(root, fixed)
+                .expect("retained root style update");
+            child_percent_width = Some((found - padding.left - padding.right).max(0.));
+        }
         let root_layout = *cache.tree.layout(root).expect("computed root");
         let inner_width =
             (root_layout.size.width - root_layout.padding.left - root_layout.padding.right).max(0.);

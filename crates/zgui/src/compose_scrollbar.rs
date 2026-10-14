@@ -2,10 +2,25 @@
 use crate::{
     input::{EventPhase, InputEvent, Key, PointerButton},
     reactive::Signal,
-    scene::{Layout, NodeId, NodeKind, Style, Transform},
+    scene::{Color, Layout, NodeId, NodeKind, QuadStyle, Style, Transform},
     semantics::{Role, ScrollAxis, SemanticNode},
     widgets::Ui,
 };
+
+/// The thumb's thickness at rest and under the pointer (or dragged), and
+/// how far its rounded ends sit in from the track's.
+const THUMB: f32 = 6.;
+const THUMB_ACTIVE: f32 = 8.;
+const THUMB_INSET: f32 = 2.;
+
+/// A rounded thumb of `color`, `thickness` across.
+fn thumb_kind(color: Color, thickness: f32) -> NodeKind {
+    NodeKind::Quad(QuadStyle {
+        fill: color,
+        radius: thickness / 2.,
+        ..Default::default()
+    })
+}
 
 pub(crate) fn mount(
     ui: &mut Ui,
@@ -21,10 +36,10 @@ pub(crate) fn mount(
         ui.scene
             .borrow_mut()
             .append(track, NodeKind::Rect(ui.theme.hover), Style::default());
-    let thumb =
-        ui.scene
-            .borrow_mut()
-            .append(track, NodeKind::Rect(ui.theme.accent), Style::default());
+    let thumb = ui
+        .scene
+        .borrow_mut()
+        .append(track, thumb_kind(ui.theme.accent, THUMB), Style::default());
     let main = move |size: (f32, f32)| if horizontal { size.0 } else { size.1 };
     let event_size = size.clone();
     let event_extent = extent.clone();
@@ -32,6 +47,9 @@ pub(crate) fn mount(
     let scene = ui.scene.clone();
     let focused = ui.signal(false);
     let write_focus = focused.clone();
+    // Under the pointer, or dragged: the thumb widens and brightens.
+    let active = ui.signal(false);
+    let write_active = active.clone();
     let thumb_color = ui.theme.accent;
     let focused_color = ui.theme.text;
     let mut grab = None;
@@ -44,6 +62,19 @@ pub(crate) fn mount(
         }
         if matches!(cx.event, InputEvent::Blur) {
             write_focus.set(false);
+        }
+        match cx.event {
+            InputEvent::PointerEnter | InputEvent::PointerMove { .. } => {
+                write_active.set(true);
+            }
+            // A drag ended: the next move over the bar lights it again.
+            InputEvent::PointerLeave if grab.is_none() => {
+                write_active.set(false);
+            }
+            InputEvent::PointerUp { .. } | InputEvent::PointerCancel | InputEvent::Blur => {
+                write_active.set(false);
+            }
+            _ => {}
         }
         if cx.default_prevented()
             && !matches!(
@@ -113,6 +144,13 @@ pub(crate) fn mount(
                 grab = None;
                 cx.release_pointer();
                 None
+            }
+            // The wheel over the bar scrolls what it scrolls.
+            InputEvent::Scroll {
+                delta_x, delta_y, ..
+            } => {
+                let delta = if horizontal { *delta_x } else { *delta_y };
+                (delta.is_finite() && delta != 0.).then_some(before + delta as f64)
             }
             InputEvent::KeyDown { key, .. } => match key {
                 Key::Home => Some(0.),
@@ -209,32 +247,40 @@ pub(crate) fn mount(
         } else {
             0.
         };
-        let thumb_size = if horizontal {
-            (thumb_length, track_size.1)
+        // Drawn slimmer than the track it hits in, centred across it, its
+        // rounded ends inset along it.
+        let active = active.get();
+        let across = (if active { THUMB_ACTIVE } else { THUMB }).min(thickness);
+        let along = (thumb_length - 2. * THUMB_INSET).max(across);
+        let drawn = if horizontal {
+            (along, across)
         } else {
-            (track_size.0, thumb_length)
+            (across, along)
         };
-        scene.set_style(thumb, fixed(thumb_size.0, thumb_size.1));
-        scene.set_kind(
-            thumb,
-            NodeKind::Rect(if focused.get() {
-                focused_color
-            } else {
-                thumb_color
-            }),
-        );
+        scene.set_style(thumb, fixed(drawn.0, drawn.1));
+        let color = if focused.get() {
+            focused_color
+        } else if active {
+            // Brighter: the colour's alpha raised by three quarters.
+            let Color(r, g, b, a) = thumb_color;
+            Color(r, g, b, (a as f32 * 1.75).min(255.) as u8)
+        } else {
+            thumb_color
+        };
+        scene.set_kind(thumb, thumb_kind(color, across));
         let value = offset.get().clamp(0., limit);
         let position = if limit > 0. {
             (value as f64 / limit as f64 * (length - thumb_length) as f64) as f32
         } else {
             0.
         };
+        let (start, side) = (position + THUMB_INSET, (thickness - across) / 2.);
         scene.set_transform(
             thumb,
             if horizontal {
-                Transform { x: position, y: 0. }
+                Transform { x: start, y: side }
             } else {
-                Transform { x: 0., y: position }
+                Transform { x: side, y: start }
             },
         );
         drop(scene);

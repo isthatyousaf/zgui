@@ -77,6 +77,7 @@ pub(crate) struct RareStyles {
     pub(crate) min_height: Option<f32>,
     pub(crate) max_height: Option<f32>,
     pub(crate) fade_edges: Option<[f32; 2]>,
+    pub(crate) fade_insets: Option<[f32; 2]>,
     pub(crate) border_style: Option<crate::decoration::BorderStyle>,
     pub(crate) shadows: Option<Option<std::sync::Arc<[BoxShadow]>>>,
     pub(crate) shadow: Option<Option<BoxShadow>>,
@@ -93,6 +94,7 @@ impl RareStyles {
         min_height: None,
         max_height: None,
         fade_edges: None,
+        fade_insets: None,
         border_style: None,
         shadows: None,
         shadow: None,
@@ -118,6 +120,9 @@ impl RareStyles {
         }
         if other.fade_edges.is_some() {
             self.fade_edges = other.fade_edges;
+        }
+        if other.fade_insets.is_some() {
+            self.fade_insets = other.fade_insets;
         }
         if other.border_style.is_some() {
             self.border_style = other.border_style;
@@ -1223,6 +1228,13 @@ pub trait Styled: Sized {
     /// node's clip (with `overflow_hidden` or a scroll view), per pixel.
     fn fade_edges(mut self, top: f32, bottom: f32) -> Self {
         self.styles_mut().rare_mut().fade_edges = Some([top, bottom]);
+        self
+    }
+    /// End `fade_edges`' bands this far in from the clip's top and bottom
+    /// edges, hiding content past them: a scroll view running on under a bar
+    /// fades out by the bar's edge.
+    fn fade_insets(mut self, top: f32, bottom: f32) -> Self {
+        self.styles_mut().rare_mut().fade_insets = Some([top, bottom]);
         self
     }
     fn overflow_hidden(mut self) -> Self {

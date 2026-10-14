@@ -48,6 +48,8 @@ fn premultiply_into_cell(cell: &mut [u8], pixels: &[u8], width: u32) {
 /// X11, so presenting can be a plain copy (see `copy_present`). Readback
 /// converts to RGBA.
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8Unorm;
+/// The backdrop blur atlas's format (see `atlas_texture`).
+const BLUR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 #[derive(Debug)]
 pub struct GpuError(pub String);
 impl fmt::Display for GpuError {
@@ -61,7 +63,7 @@ pub struct GpuStats {
     pub draw_calls: usize,
     /// Encoded render passes, including repainted isolated layers; excludes presentation.
     pub render_passes: usize,
-    /// Separable filter passes (two per applied backdrop blur), included in render_passes.
+    /// Backdrop filter passes (three per batch of filters blurred together), included in render_passes.
     pub blur_passes: usize,
     pub instances: usize,
     pub shaped_nodes: usize,
@@ -538,28 +540,92 @@ struct Deferred {
     /// again before any of it is reused. Saves writing every pixel twice.
     direct: bool,
 }
-/// A backdrop filter's vertical half: one draw per damaged output, reading the
-/// horizontal pass's scratch textures (see `GpuRenderer::blur`).
+/// A batch of backdrop filters' last step: each blur drawn back over the
+/// original pixels, one draw per filter and damaged output (see
+/// `GpuRenderer::blur`).
 struct VerticalBlur {
     bind: wgpu::BindGroup,
-    scissors: Vec<(u32, u32, u32, u32)>,
+    /// The filter (its index in the batch) and output of each draw.
+    draws: Vec<(u32, Scissor)>,
+    /// Drawn with `BlurPipelines::mix` (else over a copy of each area).
+    mixed: bool,
 }
-/// Separable blur pipelines. The horizontal pass reads the target and keeps
-/// its original pixels; the vertical draws write the target, or the target
-/// and a drawable of `both`'s format at presentation.
+/// The blur drawn back by dual-source blending: the blur scaled by how much
+/// of it shows, and that amount for the target's share.
+pub(crate) const BLUR_MIX: &str = "struct Mixed { @location(0) @blend_src(0) color:vec4<f32>, @location(0) @blend_src(1) amount:vec4<f32> }
+@fragment fn fs_mix(v:Vertex)->Mixed{let b=blurs[v.index];let blend=blurred(b,v.p.xy);let a=amount(b,v.p.xy)*blend.weight;return Mixed(blend.color*a,vec4(a));}";
+/// A filter's header in `blur.wgsl` (`Blur`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BlurRecord {
+    bounds: [f32; 4],
+    effect: [f32; 4],
+    area: [f32; 4],
+    shape: [f32; 4],
+    slots: [u32; 4],
+}
+/// A slot of the blur atlas (`Slot` in `blur.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SlotRecord {
+    atlas: [f32; 4],
+    region: [f32; 4],
+    owner: [u32; 4],
+}
+/// A batch of backdrop filters planned for the atlas (`GpuRenderer::plan_blur`).
+struct BlurPlan {
+    blurs: Vec<BlurRecord>,
+    /// Each slot with its size in texels and whether it is blurred (else a
+    /// copy of an area).
+    slots: Vec<(SlotRecord, (u32, u32), bool)>,
+    /// The filter and output of each draw back.
+    draws: Vec<(u32, Scissor)>,
+    mixed: bool,
+}
+/// A backdrop filter a damaged region reaches: its bounds and clip, the
+/// outputs it draws, its effects and corner radii.
+struct Filter {
+    bounds: Rect,
+    clip: Rect,
+    outputs: Vec<Rect>,
+    effects: zgui::scene::Effects,
+    corners: [f32; 4],
+}
+/// Backdrop blur pipelines (blur.wgsl): average each area down into its
+/// atlas slots, blur them across and down at that size, then draw them back
+/// over the target, mixed by dual-source blending (`mix`) where the device
+/// has it, else over a copy of the area's pixels, into the target or, at
+/// presentation, the target and a drawable of `both`'s format.
 struct BlurPipelines {
     shader: wgpu::ShaderModule,
-    /// Shared by every vertical pipeline so one bind group serves each.
+    /// Shared by every pipeline so one bind group layout serves each.
     layout: wgpu::BindGroupLayout,
-    horizontal: wgpu::RenderPipeline,
+    linear: wgpu::Sampler,
+    reduce: wgpu::RenderPipeline,
+    across: wgpu::RenderPipeline,
+    down: wgpu::RenderPipeline,
     vertical: wgpu::RenderPipeline,
+    mix: Option<wgpu::RenderPipeline>,
     both: Option<(wgpu::TextureFormat, wgpu::RenderPipeline)>,
 }
 impl BlurPipelines {
     fn new(device: &wgpu::Device) -> Self {
+        // Dual-source blending needs the WGSL extension enabled for the whole
+        // module, which only devices with the feature accept.
+        let dual = device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let source = if dual {
+            format!(
+                "enable dual_source_blending;\n{}\n{BLUR_MIX}",
+                include_str!("blur.wgsl")
+            )
+        } else {
+            include_str!("blur.wgsl").to_owned()
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("backdrop blur"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("blur.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
         let texture = |binding| wgpu::BindGroupLayoutEntry {
             binding,
@@ -571,47 +637,78 @@ impl BlurPipelines {
             },
             count: None,
         };
+        let records = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("vertical blur"),
+            label: Some("backdrop blur"),
             entries: &[
                 texture(0),
                 texture(1),
+                records(2),
+                records(3),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 2,
+                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
         });
-        let target = Some(wgpu::ColorTargetState {
-            format: FORMAT,
-            blend: None,
-            write_mask: wgpu::ColorWrites::ALL,
+        let pipeline = |entry, format| {
+            let target = Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            });
+            Self::pipeline(device, &shader, Some(&layout), entry, &[target])
+        };
+        let (reduce, across, down, vertical) = (
+            pipeline("fs_reduce", BLUR_FORMAT),
+            pipeline("fs_across", BLUR_FORMAT),
+            pipeline("fs_down", BLUR_FORMAT),
+            pipeline("fs", FORMAT),
+        );
+        // Bilinear: each sample averages up to four texels (see blur.wgsl).
+        let linear = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("backdrop blur"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         });
-        let horizontal = Self::pipeline(
-            device,
-            &shader,
-            None,
-            "fs_split",
-            &[target.clone(), target.clone()],
-        );
-        let vertical = Self::pipeline(
-            device,
-            &shader,
-            Some(&layout),
-            "fs",
-            std::slice::from_ref(&target),
-        );
+        // out = blur * amount + target * (1 - amount), every channel.
+        let mix = dual.then(|| {
+            let component = wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                operation: wgpu::BlendOperation::Add,
+            };
+            let target = Some(wgpu::ColorTargetState {
+                format: FORMAT,
+                blend: Some(wgpu::BlendState {
+                    color: component,
+                    alpha: component,
+                }),
+                write_mask: wgpu::ColorWrites::ALL,
+            });
+            Self::pipeline(device, &shader, Some(&layout), "fs_mix", &[target])
+        });
         Self {
             shader,
             layout,
-            horizontal,
+            linear,
+            reduce,
+            across,
+            down,
             vertical,
+            mix,
             both: None,
         }
     }
@@ -651,6 +748,13 @@ impl BlurPipelines {
             cache: None,
         })
     }
+    /// The pipeline drawing `blur` back over the target.
+    fn drawing(&self, blur: &VerticalBlur) -> &wgpu::RenderPipeline {
+        match &self.mix {
+            Some(mix) if blur.mixed => mix,
+            _ => &self.vertical,
+        }
+    }
     /// The vertical pipeline writing the target and a `format` drawable.
     fn both(
         &mut self,
@@ -676,6 +780,11 @@ impl BlurPipelines {
         }
         &self.both.as_ref().expect("created above").1
     }
+}
+/// Backdrop filters' scratch: two atlases at least the size a batch's slots
+/// need, the blur passes rendering from one into the other.
+struct BlurScratch {
+    atlas: [wgpu::Texture; 2],
 }
 /// The spare retained target with the views and bind groups it needs.
 struct Retained {
@@ -871,7 +980,7 @@ impl GpuContext {
                 wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
             } else {
                 wgpu::Features::empty()
-            },
+            } | (adapter.features() & wgpu::Features::DUAL_SOURCE_BLENDING),
             memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }))
@@ -1030,7 +1139,9 @@ pub struct GpuRenderer {
     /// The frame's draws, kept for their allocation.
     frame_draws: Vec<Draw>,
     background: Color,
-    images: FxHashMap<u64, (wgpu::BindGroup, usize)>,
+    /// Image textures: each bound for the quads, its size in bytes, and,
+    /// where the CPU wrote its texels, the texture (see `render_direct`).
+    images: FxHashMap<u64, (wgpu::BindGroup, usize, Option<wgpu::Texture>)>,
     #[cfg(target_os = "macos")]
     native_surfaces: Option<native_surface::SurfaceCache>,
     /// The next present joins the Core Animation transaction that resized the layer.
@@ -1068,10 +1179,8 @@ pub struct GpuRenderer {
     atlas_recycled_at: u64,
     /// Compiled on the first backdrop filter.
     blur_pipelines: Option<BlurPipelines>,
-    /// Source and intermediate blur targets, shared by the window and every
-    /// isolated layer. At least as large as the target being filtered; the
-    /// shader clamps samples to the target's own size, passed as a parameter.
-    blur_scratch: Option<(wgpu::Texture, wgpu::Texture)>,
+    /// Backdrop blur scratch, shared by the window and every isolated layer.
+    blur_scratch: Option<BlurScratch>,
 }
 impl GpuRenderer {
     pub fn new(width: u32, height: u32) -> Result<Self, GpuError> {
@@ -1238,7 +1347,9 @@ impl GpuRenderer {
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("retained frame vertices"),
             size: 4096,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
         Ok(Self {
@@ -1469,11 +1580,11 @@ impl GpuRenderer {
         self.flush_pending();
         self.layers.clear();
         // Scratch grows on demand; release it when the window shrinks a lot.
-        if self
-            .blur_scratch
-            .as_ref()
-            .is_some_and(|(source, _)| source.width() > width * 2 || source.height() > height * 2)
-        {
+        if self.blur_scratch.as_ref().is_some_and(|scratch| {
+            scratch.atlas.iter().any(|texture| {
+                texture.width() > width * 2 || texture.height() > height * 2
+            })
+        }) {
             self.blur_scratch = None;
         }
         self.width = width;
@@ -2322,7 +2433,7 @@ impl GpuRenderer {
                         let view = cache.texture(frame.id()).create_view(&Default::default());
                         let bytes = cache.bytes(frame.id());
                         let bind = self.texture_bind(&view, "native CoreVideo frame");
-                        self.images.insert(frame.id(), (bind, bytes));
+                        self.images.insert(frame.id(), (bind, bytes, None));
                     }
                     canvas_image = Some(frame.id());
                     quads.push(Quad {
@@ -2625,9 +2736,7 @@ impl GpuRenderer {
             if let Some((rect, [top, bottom])) = item.mask {
                 let mask = [rect.y, rect.y + rect.height, top, bottom];
                 for quad in &mut quads[start as usize..] {
-                    if quad.options[2] < 0.5 {
-                        quad.mask = mask;
-                    }
+                    quad.mask = mask;
                 }
             }
             // When the clip only culls whole quads, apply it on the CPU and
@@ -2726,27 +2835,105 @@ impl GpuRenderer {
         if needed > VERTEX_BUDGET {
             return Err(GpuError("frame geometry exceeds 32 MiB budget".into()));
         }
-        // Plain frames (no filters, images or layers, nothing else recorded)
-        // skip wgpu: see `metal_frame`.
+        // A clean filter elsewhere in the retained target needs no replay and
+        // must not force every unrelated quad into its own render pass.
+        let has_damaged_blur = has_blur
+            && draws.iter().any(|draw| {
+                draw.blur.is_some_and(|(bounds, _, _)| {
+                    damage.iter().any(|region| {
+                        region
+                            .intersection(draw.clip)
+                            .and_then(|rect| rect.intersection(bounds))
+                            .and_then(|output| scissor(output, self.scale, self.width, self.height))
+                            .is_some()
+                    })
+                })
+            });
+        // The part of a filter's output inside `region`, if it reaches it.
+        let filtered = |draw: &Draw, region: &Rect| {
+            let (bounds, _, _) = draw.blur?;
+            region.intersection(draw.clip)?.intersection(bounds)
+        };
+        // A filter samples everything painted before it, so the filters a
+        // damaged region reaches end passes. A filter joins the batch before
+        // it when nothing drawn since that batch's first filter reaches its
+        // area (its backdrop is complete there already): the batch blurs
+        // together and draws back at its start, in one split. It may also
+        // sit on another filter of the batch whose blur alone reaches it, at
+        // most half as wide there (a frosted pill on a softly blurred edge):
+        // it then blurs the backdrop under that blur, which differs from
+        // blurring the blur by under an eighth of its radius. Between
+        // splits, every region shares one pass: a scissor per region, draws
+        // batched within it.
+        let mut batches: Vec<(usize, Vec<usize>)> = Vec::new();
+        if has_damaged_blur {
+            let margin = 1. / self.scale;
+            // What a draw paints: its quads and, for a filter, its blur.
+            let reaches = |draw: &Draw, area: Rect| {
+                let blur = draw.blur.and_then(|(bounds, _, _)| bounds.intersection(draw.clip));
+                [draw.bounds.intersection(draw.clip), blur]
+                    .into_iter()
+                    .flatten()
+                    .any(|painted| painted.intersection(area).is_some())
+            };
+            for i in 0..draws.len() {
+                let draw = &draws[i];
+                if !regions.iter().any(|(region, _)| filtered(draw, region).is_some()) {
+                    continue;
+                }
+                let Some((bounds, effects, _)) = draw.blur else {
+                    continue;
+                };
+                let area = bounds.intersection(draw.clip);
+                let joins = area.zip(batches.last()).is_some_and(|(area, (start, filters))| {
+                    let area = area.expand(margin);
+                    (*start..i).all(|k| {
+                        let before = &draws[k];
+                        let quads = before.bounds.intersection(before.clip);
+                        !reaches(before, area)
+                            || filters.contains(&k)
+                                && quads.is_none_or(|quads| quads.intersection(area).is_none())
+                                && before.blur.is_some_and(|(under, beneath, _)| {
+                                    2. * peak_blur(under, &beneath, area) <= effects.blur_radius
+                                })
+                    })
+                });
+                match batches.last_mut() {
+                    Some((_, filters)) if joins => filters.push(i),
+                    _ => batches.push((i, vec![i])),
+                }
+            }
+        }
+        // Frames of quads (images the CPU wrote, no layers, nothing else
+        // recorded, any filters mixed by dual-source blending) skip wgpu:
+        // see `metal_frame`.
         #[cfg(target_os = "macos")]
         if !self.in_layer
-            && !has_blur
             && self.mapped.is_some()
             && self.texture_uploads.is_empty()
             && self.pending.get_mut().is_none()
             && (shown.is_some() || copies.is_empty())
             && (self.layer_present.is_some() || self.surface.is_none())
             && self.single_pass_format.is_none()
-            && draws
-                .iter()
-                .all(|draw| draw.image.is_none() && draw.layer.is_none())
+            && draws.iter().all(|draw| {
+                draw.layer.is_none()
+                    && draw.image.is_none_or(|id| {
+                        self.images.get(&id).is_some_and(|image| image.2.is_some())
+                    })
+            })
+            && (batches.is_empty()
+                || self
+                    .device
+                    .features()
+                    .contains(wgpu::Features::DUAL_SOURCE_BLENDING))
             && self
                 .metal_frame
                 .get_or_init(|| metal_frame::MetalFrame::new(&self.device, &self.queue).ok())
-                .is_some()
+                .as_ref()
+                .is_some_and(|frame| batches.is_empty() || frame.blurs())
         {
             let catch_up = catch_up.map(|(_, instances)| instances);
-            return Ok(self.render_direct(quads, draws, &regions, catch_up, shown, stats));
+            return Ok(self.render_direct(quads, draws, &regions, &batches, catch_up, shown, stats));
         }
         let mut encoder = self.device.create_command_encoder(&Default::default());
         // Glyphs rasterized while building this frame land before any pass
@@ -2775,10 +2962,37 @@ impl GpuRenderer {
                 stats.scroll_copies += 1;
             }
         }
+        // Every batch of filters planned now: their records ride in the
+        // frame's vertex buffer after the quads, and the atlas fits them all.
+        let plans: Vec<Option<BlurPlan>> = batches
+            .iter()
+            .map(|(_, members)| self.plan_blur(&batch_filters(&draws, &regions, members)))
+            .collect();
         let bytes: &[u8] = bytemuck::cast_slice(&quads);
+        let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
+        // Each part at an aligned offset in the buffer.
+        let mut records = Vec::new();
+        let mut record = |part: &[u8]| {
+            let at = (bytes.len() + records.len()).next_multiple_of(align);
+            records.resize(at - bytes.len(), 0);
+            records.extend_from_slice(part);
+            (at as u64, part.len() as u64)
+        };
+        let ranges: Vec<Option<[(u64, u64); 2]>> = plans
+            .iter()
+            .map(|plan| {
+                let plan = plan.as_ref()?;
+                let slots: Vec<SlotRecord> = plan.slots.iter().map(|slot| slot.0).collect();
+                Some([
+                    record(bytemuck::cast_slice(&plan.blurs)),
+                    record(bytemuck::cast_slice(&slots)),
+                ])
+            })
+            .collect();
+        let needed = bytes.len() + records.len();
         let vertices = if let Some(mapped) = &mut self.mapped {
             let mapped = mapped.get_mut();
-            let (vertices, allocated) = mapped.write(bytes);
+            let (vertices, allocated) = mapped.write_parts(&[bytes, &records]);
             stats.vertex_buffer_allocations += usize::from(allocated);
             self.vertex_capacity = mapped.bytes();
             vertices
@@ -2788,57 +3002,27 @@ impl GpuRenderer {
                 self.vertices = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("retained frame vertices"),
                     size: self.vertex_capacity as u64,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::STORAGE,
                     mapped_at_creation: false,
                 });
                 stats.vertex_buffer_allocations += 1;
             }
             let vertices = self.vertices.clone();
-            self.belt
-                .get_mut()
-                .write_buffer(
-                    &mut encoder,
-                    &vertices,
-                    0,
-                    wgpu::BufferSize::new(bytes.len() as u64).expect("background quad"),
-                )
-                .copy_from_slice(bytes);
+            let mut view = self.belt.get_mut().write_buffer(
+                &mut encoder,
+                &vertices,
+                0,
+                wgpu::BufferSize::new(needed as u64).expect("background quad"),
+            );
+            view.slice(..bytes.len()).copy_from_slice(bytes);
+            view.slice(bytes.len()..).copy_from_slice(&records);
+            drop(view);
             self.belt.get_mut().finish();
             vertices
         };
-        // A clean filter elsewhere in the retained target needs no replay and
-        // must not force every unrelated quad into its own render pass.
-        let has_damaged_blur = has_blur
-            && draws.iter().any(|draw| {
-                draw.blur.is_some_and(|(bounds, _, _)| {
-                    damage.iter().any(|region| {
-                        region
-                            .intersection(draw.clip)
-                            .and_then(|rect| rect.intersection(bounds))
-                            .and_then(|output| scissor(output, self.scale, self.width, self.height))
-                            .is_some()
-                    })
-                })
-            });
-        // The part of a filter's output inside `region`, if it reaches it.
-        let filtered = |draw: &Draw, region: &Rect| {
-            let (bounds, _, _) = draw.blur?;
-            region.intersection(draw.clip)?.intersection(bounds)
-        };
-        // A filter samples everything painted before it, so each filter a
-        // damaged region reaches ends a pass. Between filters, every region
-        // shares one pass: a scissor per region, draws batched within it.
-        let splits: Vec<usize> = if has_damaged_blur {
-            (0..draws.len())
-                .filter(|&i| {
-                    regions
-                        .iter()
-                        .any(|(region, _)| filtered(&draws[i], region).is_some())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let splits: Vec<usize> = batches.iter().map(|(start, _)| *start).collect();
         // The window's own frame can be drawn at presentation in the same pass
         // as the drawable (`present_single_pass`). With damaged filters, only
         // the draws after the last one wait: everything before it must land
@@ -2861,7 +3045,8 @@ impl GpuRenderer {
             self.whole_frames = 0;
         }
         let mut from = 0;
-        // Each filter's vertical half opens the pass after its horizontal one.
+        // Each batch of filters is drawn back at the start of the pass after
+        // its blur passes.
         let mut vertical = None;
         for (segment, end) in splits.iter().copied().chain([draws.len()]).enumerate() {
             if defer && end == draws.len() {
@@ -2888,8 +3073,9 @@ impl GpuRenderer {
             }
             if segment == 0 || end > from {
                 stats.render_passes += 1;
+                let label = ["damage 0", "damage 1", "damage 2", "damage 3"][segment.min(3)];
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("damage"),
+                    label: Some(label),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &self.view,
                         depth_slice: None,
@@ -2910,7 +3096,7 @@ impl GpuRenderer {
                     stats.draw_calls += 1;
                 }
                 if let Some(blur) = vertical.take() {
-                    let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
+                    let pipeline = self.blur_pipelines.as_ref().expect("filtered").drawing(&blur);
                     Self::encode_vertical(&mut pass, pipeline, &blur, &mut stats);
                 }
                 pass.set_vertex_buffer(0, vertices.slice(..));
@@ -2936,20 +3122,14 @@ impl GpuRenderer {
                     );
                 }
             }
-            let Some(draw) = draws.get(end) else {
+            if segment == batches.len() {
                 break;
-            };
-            let (bounds, effects, corners) = draw.blur.expect("split at a filter");
-            let outputs = regions
-                .iter()
-                .filter_map(|(region, _)| filtered(draw, region));
-            vertical = self.blur(&mut encoder, bounds, draw.clip, outputs, effects, corners);
-            if let Some(blur) = &vertical {
-                stats.draw_calls += blur.scissors.len();
-                stats.render_passes += 1;
-                stats.blur_passes += 2;
             }
-            // The filtered draw's own quads open the next pass.
+            vertical = plans[segment]
+                .as_ref()
+                .zip(ranges[segment])
+                .and_then(|(plan, ranges)| self.blur(&mut encoder, plan, &vertices, ranges, &mut stats));
+            // The first filtered draw's own quads open the next pass.
             from = end;
         }
         *self.pending.get_mut() = Some(encoder);
@@ -2962,11 +3142,13 @@ impl GpuRenderer {
     /// Record this frame with Metal directly (`metal_frame`): the pass the
     /// wgpu path records for a frame of plain draws, committed at once.
     #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
     fn render_direct(
         &mut self,
         quads: Vec<Quad>,
         mut draws: Vec<Draw>,
         regions: &[(Rect, Scissor)],
+        batches: &[(usize, Vec<usize>)],
         catch_up: Option<std::ops::Range<u32>>,
         shown: Option<usize>,
         mut stats: GpuStats,
@@ -2980,7 +3162,26 @@ impl GpuRenderer {
             mapped.last_metal().retain()
         };
         self.whole_frames = 0;
-        let first = occluded_from(&quads, &draws, regions, self.scale);
+        // As `render`'s wgpu passes: a split at each batch of filters.
+        let first = if batches.is_empty() {
+            occluded_from(&quads, &draws, regions, self.scale)
+        } else {
+            vec![0; regions.len()]
+        };
+        // Every batch planned first: the atlas then fits them all.
+        let plans: Vec<_> = batches
+            .iter()
+            .map(|(_, members)| {
+                let plan = self.plan_blur(&batch_filters(&draws, regions, members))?;
+                let slots: Vec<SlotRecord> = plan.slots.iter().map(|slot| slot.0).collect();
+                let rects: Vec<Scissor> = plan
+                    .slots
+                    .iter()
+                    .map(|(record, (w, h), _)| (record.atlas[0] as u32, record.atlas[1] as u32, *w, *h))
+                    .collect();
+                Some((plan, slots, rects))
+            })
+            .collect();
         let committed = {
             let frame = self
                 .metal_frame
@@ -2999,6 +3200,11 @@ impl GpuRenderer {
             };
             // The retained target: through the layer, this frame's surface.
             let (target, atlas) = (raw(&self.target), raw(&self.atlas));
+            let blur_atlas = self
+                .blur_scratch
+                .as_ref()
+                .filter(|_| plans.iter().any(Option::is_some))
+                .map(|scratch| scratch.atlas.each_ref().map(raw));
             let mut pass = frame.begin(&target, &vertices, self.viewport_values);
             let present = self.layer_present.as_ref();
             if let (Some(instances), Some(present), Some(shown)) = (catch_up, present, shown) {
@@ -3012,22 +3218,66 @@ impl GpuRenderer {
             } else {
                 Shading::Full
             };
-            for (index, (region, region_scissor)) in regions.iter().enumerate() {
-                pass.scissor(*region_scissor);
-                if first[index] == 0 {
-                    pass.quads(frame, clear, true, 0..1);
-                    stats.draw_calls += 1;
-                }
-                self.batches(*region, &draws, first[index], |batch| {
-                    let Some(rect) = scissor(batch.rect, self.scale, self.width, self.height)
-                    else {
-                        return;
+            // The image the quads sample (None: the glyph atlas).
+            let mut sampled = None;
+            let splits = batches.iter().map(|(start, _)| *start);
+            let mut from = 0;
+            // The batch drawn back at the start of the pass after its blur.
+            let mut blurred = None;
+            for (segment, end) in splits.chain([draws.len()]).enumerate() {
+                if let Some((plan, slots, _)) = blurred.take() {
+                    let plan: &BlurPlan = plan;
+                    let records = metal_frame::BlurRecords {
+                        blurs: bytemuck::cast_slice(&plan.blurs),
+                        slots: bytemuck::cast_slice(slots),
                     };
-                    pass.scissor(rect);
-                    pass.quads(frame, batch.shading, false, batch.start..batch.end);
-                    stats.draw_calls += 1;
-                    stats.instances += (batch.end - batch.start) as usize;
-                });
+                    let blur = blur_atlas.as_ref().expect("planned");
+                    pass.mixes(frame, &blur[0], &records, &plan.draws);
+                    stats.draw_calls += plan.draws.len();
+                }
+                for (index, (region, region_scissor)) in regions.iter().enumerate() {
+                    pass.scissor(*region_scissor);
+                    if segment == 0 && first[index] == 0 {
+                        pass.quads(frame, clear, true, 0..1);
+                        stats.draw_calls += 1;
+                    }
+                    self.batches(*region, &draws[from..end], first[index], |batch| {
+                        let Some(rect) = scissor(batch.rect, self.scale, self.width, self.height)
+                        else {
+                            return;
+                        };
+                        let image = batch.source.0;
+                        if image != sampled {
+                            match image.and_then(|id| self.images.get(&id)?.2.as_ref()) {
+                                Some(texture) => pass.texture(&raw(texture)),
+                                None => pass.texture(&atlas),
+                            }
+                            sampled = image;
+                        }
+                        pass.scissor(rect);
+                        pass.quads(frame, batch.shading, false, batch.start..batch.end);
+                        stats.draw_calls += 1;
+                        stats.instances += (batch.end - batch.start) as usize;
+                    });
+                }
+                let Some(Some((plan, slots, rects))) = plans.get(segment) else {
+                    from = end;
+                    continue;
+                };
+                let records = metal_frame::BlurRecords {
+                    blurs: bytemuck::cast_slice(&plan.blurs),
+                    slots: bytemuck::cast_slice(slots),
+                };
+                let blur = blur_atlas.as_ref().expect("planned");
+                pass.blur(frame, &target, [&blur[0], &blur[1]], &records, rects);
+                pass.resume(&target);
+                pass.texture(&atlas);
+                sampled = None;
+                stats.draw_calls += 3 * rects.iter().filter(|r| r.2 > 0 && r.3 > 0).count();
+                stats.render_passes += 4;
+                stats.blur_passes += 3;
+                blurred = Some((plan, slots, rects));
+                from = end;
             }
             pass.commit()
         };
@@ -3164,7 +3414,7 @@ impl GpuRenderer {
             });
             let mut stats = GpuStats::default();
             if let Some(blur) = &deferred.blur {
-                let pipeline = &self.blur_pipelines.as_ref().expect("filtered").vertical;
+                let pipeline = self.blur_pipelines.as_ref().expect("filtered").drawing(blur);
                 Self::encode_vertical(&mut pass, pipeline, blur, &mut stats);
             }
             let quads = &self.context.inner.quads;
@@ -3539,151 +3789,277 @@ impl GpuRenderer {
         stats.draw_calls += 1;
         stats.instances += (batch.end - batch.start) as usize;
     }
+    /// Plan a batch of backdrop filters (see blur.wgsl): each one's levels
+    /// as slots of the atlas, packed, the atlas grown to hold them.
+    fn plan_blur(&mut self, filters: &[Filter]) -> Option<BlurPlan> {
+        // Mixed over the target by dual-source blending, unless drawn at
+        // presentation into two targets at once (which it cannot be): then a
+        // copy of each area's pixels to mix with.
+        let mixed = self
+            .device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            && self.single_pass_format.is_none();
+        let scale = self.scale;
+        let mut blurs = Vec::new();
+        // Each slot with its size in texels and whether it is blurred (else
+        // a copy of an area).
+        let mut slots: Vec<(SlotRecord, (u32, u32), bool)> = Vec::new();
+        let mut draws = Vec::new();
+        for filter in filters {
+            let Some((ax, ay, aw, ah)) = filter
+                .bounds
+                .intersection(filter.clip)
+                .and_then(|area| scissor(area, scale, self.width, self.height))
+            else {
+                continue;
+            };
+            let index = blurs.len() as u32;
+            let before = draws.len();
+            draws.extend(
+                filter
+                    .outputs
+                    .iter()
+                    .filter_map(|output| scissor(*output, scale, self.width, self.height))
+                    .map(|output| (index, output)),
+            );
+            if draws.len() == before {
+                continue;
+            }
+            let sigma = (filter.effects.blur_radius * scale).clamp(0.1, 64.);
+            // Finite and non-negative (`Scene::set_effects`).
+            let fade = (filter.effects.edge_fade * scale).clamp(0., 1e6);
+            // Sigma, and under a fade, each halving of it down to 2 px (below
+            // which the backdrop shows through, the blur all but invisible).
+            let levels: Vec<f32> = if fade > 0. {
+                std::iter::successors(Some(sigma), |s| (s / 2. >= 2.).then_some(s / 2.)).collect()
+            } else {
+                vec![sigma]
+            };
+            let area = [ax as f32, ay as f32, (ax + aw) as f32, (ay + ah) as f32];
+            let bounds = [
+                filter.bounds.x * scale,
+                filter.bounds.y * scale,
+                filter.bounds.width * scale,
+                filter.bounds.height * scale,
+            ];
+            let edges = [bounds[0], bounds[1], bounds[0] + bounds[2], bounds[1] + bounds[3]];
+            let first = slots.len() as u32;
+            for (k, &level) in levels.iter().enumerate() {
+                // Blurred where sigma spans 1.5 to 3 texels: a 16 px blur on a
+                // 2x display (sigma 32) runs at an eighth of the size (4
+                // texels), sigma 4 at half. Below sigma 3, the full size.
+                let factor = (level / 1.5).log2().floor().clamp(0., 3.).exp2();
+                // The pixels whose sigma lies within an octave of this
+                // level's (see `blurred`), and as far again as its taps reach.
+                let region = if levels.len() == 1 {
+                    Some(area)
+                } else {
+                    // Sigma at distance d in: sigma * (d / fade)^2.
+                    let at = |octaves: i32| fade * 2_f32.powi(-octaves).sqrt();
+                    let near = if k + 1 == levels.len() { 0. } else { at(k as i32 + 1) };
+                    let far = if k == 0 { f32::INFINITY } else { at(k as i32 - 1) };
+                    band(area, edges, near, far)
+                };
+                let reach = ((3. * level / factor).ceil() + 1.) * factor;
+                let [x0, y0, x1, y1] = region.map_or([area[0], area[1], area[0], area[1]], |r| {
+                    [
+                        (r[0] - reach).max(area[0]).floor(),
+                        (r[1] - reach).max(area[1]).floor(),
+                        (r[2] + reach).min(area[2]).ceil(),
+                        (r[3] + reach).min(area[3]).ceil(),
+                    ]
+                });
+                let size = (
+                    ((x1 - x0) / factor).ceil() as u32,
+                    ((y1 - y0) / factor).ceil() as u32,
+                );
+                slots.push((
+                    SlotRecord {
+                        atlas: [0., 0., size.0 as f32, size.1 as f32],
+                        region: [x0, y0, factor, level / factor],
+                        owner: [index, 0, 0, 0],
+                    },
+                    size,
+                    true,
+                ));
+            }
+            let original = if mixed {
+                u32::MAX
+            } else {
+                slots.push((
+                    SlotRecord {
+                        atlas: [0., 0., aw as f32, ah as f32],
+                        region: [area[0], area[1], 1., 0.],
+                        owner: [index, 0, 0, 0],
+                    },
+                    (aw, ah),
+                    false,
+                ));
+                slots.len() as u32 - 1
+            };
+            blurs.push(BlurRecord {
+                bounds,
+                effect: [filter.effects.opacity, fade, sigma, *levels.last().expect("one level")],
+                area,
+                shape: filter.corners.map(|radius| radius * scale),
+                slots: [first, levels.len() as u32, original, 0],
+            });
+        }
+        if blurs.is_empty() {
+            return None;
+        }
+        // Shelves as wide as the target, tallest slots first.
+        let mut order: Vec<usize> = (0..slots.len()).collect();
+        order.sort_by_key(|&k| std::cmp::Reverse(slots[k].1 .1));
+        let shelf_width = slots.iter().map(|slot| slot.1 .0).fold(self.width, u32::max);
+        let (mut x, mut y, mut shelf, mut width) = (0, 0, 0, 1);
+        for k in order {
+            let (w, h) = slots[k].1;
+            if x + w > shelf_width {
+                (x, y, shelf) = (0, y + shelf, 0);
+            }
+            slots[k].0.atlas[0] = x as f32;
+            slots[k].0.atlas[1] = y as f32;
+            x += w;
+            shelf = shelf.max(h);
+            width = width.max(x);
+        }
+        let height = (y + shelf).max(1);
+        // Grown in steps so a slowly growing panel does not reallocate
+        // every frame.
+        let limit = self.device.limits().max_texture_dimension_2d;
+        if width > limit || height > limit {
+            return None;
+        }
+        let atlas = self.blur_scratch.take().map(|scratch| scratch.atlas);
+        let atlas = [0, 1].map(|i| match &atlas {
+            Some(atlas) if atlas[i].width() >= width && atlas[i].height() >= height => atlas[i].clone(),
+            current => {
+                let (current_w, current_h) =
+                    current.as_ref().map_or((0, 0), |a| (a[i].width(), a[i].height()));
+                let grow = |want: u32, have: u32| want.max(have).next_multiple_of(64).min(limit);
+                atlas_texture(&self.device, grow(width, current_w), grow(height, current_h))
+            }
+        });
+        self.blur_scratch = Some(BlurScratch { atlas });
+        Some(BlurPlan {
+            blurs,
+            slots,
+            draws,
+            mixed,
+        })
+    }
+    /// Blur a batch of backdrop filters (see `plan_blur`): the reduce,
+    /// across and down passes, every slot of the batch drawn in each. Its
+    /// records lie in `buffer` (offset and size of the filters', then the
+    /// slots').
     fn blur(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
-        bounds: Rect,
-        clip: Rect,
-        outputs: impl IntoIterator<Item = Rect>,
-        effects: zgui::scene::Effects,
-        corners: [f32; 4],
+        plan: &BlurPlan,
+        buffer: &wgpu::Buffer,
+        ranges: [(u64, u64); 2],
+        stats: &mut GpuStats,
     ) -> Option<VerticalBlur> {
-        let sigma = (effects.blur_radius * self.scale).clamp(0.1, 64.);
-        let radius = (sigma * 3.).ceil() as u32;
-        // Samples stay inside the filter's visible pixels (see blur.wgsl).
-        let (ax, ay, aw, ah) = bounds
-            .intersection(clip)
-            .and_then(|area| scissor(area, self.scale, self.width, self.height))?;
-        let scissors: Vec<_> = outputs
-            .into_iter()
-            .filter_map(|output| scissor(output, self.scale, self.width, self.height))
-            .collect();
-        if scissors.is_empty() {
-            return None;
-        }
+        let BlurPlan {
+            slots,
+            draws,
+            mixed,
+            ..
+        } = plan;
+        let mixed = *mixed;
         if self.blur_pipelines.is_none() {
             self.blur_pipelines = Some(BlurPipelines::new(&self.device));
         }
-        if self
-            .blur_scratch
-            .as_ref()
-            .is_none_or(|(source, _)| source.width() < self.width || source.height() < self.height)
-        {
-            // Round up so a slowly growing layer does not reallocate every frame.
-            let (current_w, current_h) = self
-                .blur_scratch
-                .as_ref()
-                .map_or((0, 0), |(source, _)| (source.width(), source.height()));
-            let width = self.width.max(current_w).next_multiple_of(256);
-            let height = self.height.max(current_h).next_multiple_of(256);
-            let limit = self.device.limits().max_texture_dimension_2d;
-            let (width, height) = (width.min(limit), height.min(limit));
-            self.blur_scratch = Some((
-                texture(&self.device, width, height, "backdrop source"),
-                texture(&self.device, width, height, "horizontal blur"),
-            ));
-        }
-        let pipelines = self.blur_pipelines.as_ref().expect("created above");
-        let (source, intermediate) = self.blur_scratch.as_ref().expect("created above");
-        let source_view = source.create_view(&Default::default());
-        let intermediate_view = intermediate.create_view(&Default::default());
-        let uniform = |vertical: bool| {
-            let params: [f32; 20] = [
-                if vertical { 0. } else { 1. },
-                if vertical { 1. } else { 0. },
-                sigma,
-                if vertical { 1. } else { 0. },
-                bounds.x * self.scale,
-                bounds.y * self.scale,
-                bounds.width * self.scale,
-                bounds.height * self.scale,
-                effects.opacity,
-                effects.edge_fade * self.scale,
-                // The filtered target's size: scratch textures may be larger.
-                self.width as f32,
-                self.height as f32,
-                ax as f32,
-                ay as f32,
-                (ax + aw) as f32,
-                (ay + ah) as f32,
-                corners[0] * self.scale,
-                corners[1] * self.scale,
-                corners[2] * self.scale,
-                corners[3] * self.scale,
-            ];
-            upload::init_buffer(
-                &self.device,
-                self.mapped.is_some(),
-                "blur parameters",
-                bytemuck::cast_slice(&params),
-                wgpu::BufferUsages::UNIFORM,
-            )
-        };
-        let texture = |binding, view| wgpu::BindGroupEntry {
-            binding,
-            resource: wgpu::BindingResource::TextureView(view),
-        };
-        let horizontal = uniform(false);
-        let horizontal = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("horizontal blur"),
-            layout: &pipelines.horizontal.get_bind_group_layout(0),
-            entries: &[
-                texture(0, &self.view),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: horizontal.as_entire_binding(),
-                },
-            ],
-        });
-        let vertical = uniform(true);
-        let vertical = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vertical blur"),
-            layout: &pipelines.layout,
-            entries: &[
-                texture(0, &intermediate_view),
-                texture(1, &source_view),
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: vertical.as_entire_binding(),
-                },
-            ],
-        });
-        // Horizontal: read the target, write the blur and the original pixels
-        // for every output at once. The target is unchanged until the vertical
-        // draws, so outputs sharing scratch texels compute the same values.
-        let load = wgpu::Operations {
-            load: wgpu::LoadOp::Load,
-            store: wgpu::StoreOp::Store,
-        };
-        let attachment = |view| {
-            Some(wgpu::RenderPassColorAttachment {
-                view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: load,
+        let atlas = &self.blur_scratch.as_ref().expect("planned").atlas;
+        let views = atlas.each_ref().map(|texture| texture.create_view(&Default::default()));
+        let records = |(offset, size): (u64, u64)| {
+            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer,
+                offset,
+                size: wgpu::BufferSize::new(size),
             })
         };
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("horizontal blur"),
-            color_attachments: &[attachment(&intermediate_view), attachment(&source_view)],
-            ..Default::default()
-        });
-        pass.set_pipeline(&pipelines.horizontal);
-        pass.set_bind_group(0, &horizontal, &[]);
-        for &(x, y, width, height) in &scissors {
-            // Cover the rows the vertical kernel reaches inside the area.
-            let top = y.saturating_sub(radius).max(ay);
-            let bottom = (y + height + radius).min(ay + ah);
-            pass.set_scissor_rect(x, top, width, bottom - top);
-            pass.draw(0..3, 0..1);
+        let pipelines = self.blur_pipelines.as_ref().expect("created above");
+        // Binding 1 goes unread except by the copy mix, but may never be the
+        // pass's own target.
+        let bind = |source: &wgpu::TextureView, other: &wgpu::TextureView| {
+            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("backdrop blur"),
+                layout: &pipelines.layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(source),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(other),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: records(ranges[0]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: records(ranges[1]),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::Sampler(&pipelines.linear),
+                    },
+                ],
+            })
+        };
+        // Whole-area passes: what any output draws depends on the area alone,
+        // so a partly damaged filter matches a fresh frame. Copies land in
+        // the first atlas with the averages and stay there.
+        let copies = slots.iter().any(|slot| !slot.2);
+        let passes = [
+            ("blur reduce", &pipelines.reduce, bind(&self.view, &views[1]), &views[0], false, false),
+            ("blur across", &pipelines.across, bind(&views[0], &views[0]), &views[1], true, false),
+            ("blur down", &pipelines.down, bind(&views[1], &views[1]), &views[0], true, copies),
+        ];
+        for (label, pipeline, group, target, blurred_only, keep) in &passes {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some(label),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if *keep {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, group, &[]);
+            for (k, (record, (w, h), blurred)) in slots.iter().enumerate() {
+                if *w == 0 || *h == 0 || (*blurred_only && !blurred) {
+                    continue;
+                }
+                pass.set_scissor_rect(record.atlas[0] as u32, record.atlas[1] as u32, *w, *h);
+                pass.draw(0..3, k as u32..k as u32 + 1);
+                stats.draw_calls += 1;
+            }
         }
+        stats.render_passes += passes.len();
+        stats.blur_passes += passes.len();
         Some(VerticalBlur {
-            bind: vertical,
-            scissors,
+            bind: bind(&views[0], &views[0]),
+            draws: draws.clone(),
+            mixed,
         })
     }
-    /// Draw a filter's vertical half, mixing it over the original pixels, at
-    /// the start of the pass that follows its horizontal half.
+    /// Draw a batch of filters back over the target, at the start of the
+    /// pass that follows their blur passes.
     fn encode_vertical(
         pass: &mut wgpu::RenderPass<'_>,
         pipeline: &wgpu::RenderPipeline,
@@ -3692,9 +4068,9 @@ impl GpuRenderer {
     ) {
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &blur.bind, &[]);
-        for &(x, y, width, height) in &blur.scissors {
+        for &(index, (x, y, width, height)) in &blur.draws {
             pass.set_scissor_rect(x, y, width, height);
-            pass.draw(0..3, 0..1);
+            pass.draw(0..3, index..index + 1);
             stats.draw_calls += 1;
         }
     }
@@ -3777,7 +4153,7 @@ impl GpuRenderer {
                 },
             ],
         });
-        self.images.insert(image.id(), (bind, bytes));
+        self.images.insert(image.id(), (bind, bytes, Some(texture)));
         Ok(())
     }
     /// Write premultiplied RGBA texels to `(x, y, width, height)` of a
@@ -4572,6 +4948,67 @@ impl GpuRenderer {
     }
 }
 /// `rect` less `cut`, as up to four rectangles pushed to `out`.
+/// The widest a filter of `bounds` and `effects` blurs anywhere in `area`:
+/// its radius, less under an edge fade (as blur.wgsl's `sigma`).
+fn peak_blur(bounds: Rect, effects: &zgui::scene::Effects, area: Rect) -> f32 {
+    if effects.edge_fade <= 0. {
+        return effects.blur_radius;
+    }
+    // How far in from either edge of `lo..hi` the span `from..to` reaches.
+    let deepest = |lo: f32, hi: f32, from: f32, to: f32| {
+        let at = ((lo + hi) / 2.).clamp(from, to);
+        (at - lo).min(hi - at)
+    };
+    let depth = deepest(bounds.x, bounds.x + bounds.width, area.x, area.x + area.width).min(
+        deepest(bounds.y, bounds.y + bounds.height, area.y, area.y + area.height),
+    );
+    let t = (depth / effects.edge_fade).clamp(0., 1.);
+    effects.blur_radius * t * t
+}
+/// A batch's filters (draws `members`), each with the parts of its output
+/// the damaged `regions` reach.
+fn batch_filters(draws: &[Draw], regions: &[(Rect, Scissor)], members: &[usize]) -> Vec<Filter> {
+    members
+        .iter()
+        .map(|&i| {
+            let draw = &draws[i];
+            let (bounds, effects, corners) = draw.blur.expect("batched filter");
+            Filter {
+                bounds,
+                clip: draw.clip,
+                outputs: regions
+                    .iter()
+                    .filter_map(|(region, _)| region.intersection(draw.clip)?.intersection(bounds))
+                    .collect(),
+                effects,
+                corners,
+            }
+        })
+        .collect()
+}
+/// The bounding box of the part of `area` lying `near` to `far` in from the
+/// nearest edge of `edges` (each x0, y0, x1, y1), if any.
+fn band(area: [f32; 4], edges: [f32; 4], near: f32, far: f32) -> Option<[f32; 4]> {
+    let inset = |by: f32| [edges[0] + by, edges[1] + by, edges[2] - by, edges[3] - by];
+    let meet = |a: [f32; 4], b: [f32; 4]| {
+        let r = [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])];
+        (r[0] < r[2] && r[1] < r[3]).then_some(r)
+    };
+    let within = meet(area, inset(near))?;
+    let Some(hole) = far.is_finite().then(|| meet(within, inset(far))).flatten() else {
+        return Some(within);
+    };
+    // `within` less `hole`: the strips above, below and beside it.
+    [
+        [within[0], within[1], within[2], hole[1]],
+        [within[0], hole[3], within[2], within[3]],
+        [within[0], hole[1], hole[0], hole[3]],
+        [hole[2], hole[1], within[2], hole[3]],
+    ]
+    .into_iter()
+    .filter(|s| s[0] < s[2] && s[1] < s[3])
+    .reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+}
 fn scissor_minus(rect: Scissor, cut: Scissor, out: &mut Vec<Scissor>) {
     let (x, y, right, bottom) = (rect.0, rect.1, rect.0 + rect.2, rect.1 + rect.3);
     let (cx, cy, cr, cb) = (cut.0, cut.1, cut.0 + cut.2, cut.1 + cut.3);
@@ -4637,6 +5074,24 @@ fn written(device: &wgpu::Device, queue: &wgpu::Queue, view: &wgpu::TextureView)
         ..Default::default()
     });
     queue.submit([encoder.finish()]);
+}
+/// A backdrop blur atlas: half floats, so averaging down and blurring in
+/// steps adds no 8-bit banding to smooth frost.
+fn atlas_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("backdrop blur"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: BLUR_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    })
 }
 fn texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {

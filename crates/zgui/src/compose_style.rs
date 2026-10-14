@@ -420,6 +420,7 @@ pub(crate) fn mount_style_with_intrinsic(
         }
         field!(absolute,gap,clip,flex_grow,flex_shrink,align,justify,text_wrap,margin);
         if let Some(value) = rare.fade_edges { style.fade_edges = value; }
+        if let Some(value) = rare.fade_insets { style.fade_insets = value; }
         if matches!(original_kind, NodeKind::Text { .. } | NodeKind::RichText { .. }) { style.text_wrap = current.wrap; style.text_options = current.display; }
         if let Some(padding) = resolved.padding { style.padding_edges = Some(padding); }
         if let Some((width, height)) = intrinsic_size {

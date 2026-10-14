@@ -325,6 +325,10 @@ pub struct Style {
     /// this node's clip, in the fragment shader: a scroll view whose content
     /// dissolves under a titlebar or into a composer, without a layer.
     pub fade_edges: [f32; 2],
+    /// Where `fade_edges` bands end, this far in from the clip's edges (top,
+    /// bottom): content past them is hidden, so a scroll view running on
+    /// under a bar can be faded out by the bar's edge.
+    pub fade_insets: [f32; 2],
     pub min_width: Option<f32>,
     pub max_width: Option<f32>,
     pub min_height: Option<f32>,
@@ -496,7 +500,8 @@ fn exposed(clip: Rect, dx: f32, dy: f32) -> Vec<Rect> {
     }
     strips
 }
-/// A `fade_edges` ancestor's clip and its (top, bottom) bands.
+/// A `fade_edges` ancestor's clip (less its `fade_insets`) and its (top,
+/// bottom) bands.
 pub type FadeMask = (Rect, [f32; 2]);
 #[derive(Clone)]
 pub struct PaintItem<'a> {
@@ -1232,6 +1237,7 @@ impl Scene {
         // bounds change, where it was and where it lands).
         let paints = old.clip != style.clip
             || old.fade_edges != style.fade_edges
+            || old.fade_insets != style.fade_insets
             || old.padding != style.padding
             || old.padding_edges != style.padding_edges
             || old.text_wrap != style.text_wrap
@@ -2657,11 +2663,16 @@ impl Scene {
     }
 }
 /// The mask a node passes to its children: its own when it fades its edges
-/// (over its clip), otherwise the one it inherited.
+/// (over its clip, less `fade_insets`), otherwise the one it inherited.
 fn fade_mask(inherited: Option<FadeMask>, clip: Option<Rect>, style: &Style) -> Option<FadeMask> {
     match clip {
         Some(clip) if style.fade_edges.iter().any(|band| *band > 0.) => {
-            Some((clip, style.fade_edges.map(|band| band.max(0.))))
+            let [top, bottom] = style
+                .fade_insets
+                .map(|inset| if inset.is_finite() { inset.max(0.) } else { 0. });
+            let height = (clip.height - top - bottom).max(0.);
+            let rect = Rect::new(clip.x, clip.y + top.min(clip.height), clip.width, height);
+            Some((rect, style.fade_edges.map(|band| band.max(0.))))
         }
         _ => inherited,
     }

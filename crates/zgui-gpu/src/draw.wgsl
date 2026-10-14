@@ -49,9 +49,11 @@ fn shade(input:Out)->vec4<f32> {
  }
  if v.options.x>0. {let distance=min(v.point-v.fade.xy,v.fade.xy+v.fade.zw-v.point); let f=clamp(min(distance.x,distance.y)/v.options.x,0.,1.); color.a*=f; scale*=f;}
  // A `fade_edges` ancestor: a quadratic ramp over each band, as Zeron fades
- // transcript edges.
- if v.mask.z>0. {let t=clamp((v.point.y-v.mask.x)/v.mask.z,0.,1.); color.a*=t*t; scale*=t*t;}
- if v.mask.w>0. {let b=clamp((v.mask.y-v.point.y)/v.mask.w,0.,1.); color.a*=b*b; scale*=b*b;}
+ // transcript edges, where the pixel is on screen (a transformed quad's
+ // `point` is its own, untransformed).
+ let y=v.position.y/viewport.z;
+ if v.mask.z>0. {let t=clamp((y-v.mask.x)/v.mask.z,0.,1.); color.a*=t*t; scale*=t*t;}
+ if v.mask.w>0. {let b=clamp((v.mask.y-y)/v.mask.w,0.,1.); color.a*=b*b; scale*=b*b;}
  return select(vec4(color.rgb*color.a,color.a),vec4(rgb*scale,color.a),premultiplied);
 }
 @fragment fn fs(v:Out)->@location(0) vec4<f32> { return shade(v); }

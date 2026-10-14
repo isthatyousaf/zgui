@@ -340,20 +340,26 @@ fn blur_frames_defer_the_tail_after_the_last_filter_and_still_match() {
         let stats = single.render(&b.scene, &damage).unwrap();
         blurred += stats.blur_passes;
         if n > 0 {
-            // Draws up to the filter, its horizontal half, then presentation
-            // with the vertical half and everything after it.
+            // Draws up to the filter, its three blur passes, then
+            // presentation with the blur drawn back and everything after it.
             assert!(
-                stats.render_passes <= 3,
+                stats.render_passes <= 5,
                 "frame {n}: {} passes",
                 stats.render_passes
             );
         }
+        // Presented in one pass, the blur is mixed over a copy of the area in
+        // the shader; otherwise by the GPU's dual-source blending. Mid-fade
+        // the two round a byte apart at most.
+        let close = |a: &[u8], b: &[u8]| {
+            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.abs_diff(*b) <= 1)
+        };
         assert!(
-            single.debug_present_offscreen().unwrap() == expected,
+            close(&single.debug_present_offscreen().unwrap(), &expected),
             "frame {n}: presented bytes differ"
         );
         assert!(
-            single.readback().unwrap() == retained,
+            close(&single.readback().unwrap(), &retained),
             "frame {n}: retained target differs"
         );
         assert_eq!(

@@ -808,6 +808,22 @@ pub fn provide_with<T: 'static>(
         Box::new(child),
     ))
 }
+/// A vertical scrollbar for a scroll view, drawn apart from it: place it
+/// over the view's right edge, after anything that should not cover it (a
+/// frosted bar the view scrolls under). `offset` is the view's scroll offset
+/// (as `scroll`'s or a virtual list's) and `extent` its content height; the
+/// view's length is the bar's own height.
+pub fn scrollbar(offset: Signal<f32>, mut extent: impl FnMut() -> f32 + 'static) -> View {
+    View::new(Kind::Region(Box::new(move |ui, root, _| {
+        let size = ui.observe_content_size(root);
+        let length = ui.signal(0_f32);
+        let write = length.clone();
+        ui.bind(root, move || {
+            write.set(extent());
+        });
+        crate::compose_scrollbar::mount(ui, root, offset, size, length, false);
+    })))
+}
 /// A conditional region. Equal selector values retain their component and local state.
 pub fn switch<K: PartialEq + Clone + 'static>(
     mut select: impl FnMut() -> K + 'static,
@@ -2813,8 +2829,8 @@ pub mod prelude {
     pub use super::{
         Context, Slot, VariableHeights, View, button, checkbox, column, component, div, image,
         image_signal, keyed, measured_rows, measured_virtual_list, menu, menu_item, modal, overlay,
-        popover, progress, provide, provide_with, row, scroll, scroll_x, slider, submenu, switch,
-        text, text_area, text_input, text_signal, variable_virtual_list, virtual_list,
+        popover, progress, provide, provide_with, row, scroll, scroll_x, scrollbar, slider, submenu,
+        switch, text, text_area, text_input, text_signal, variable_virtual_list, virtual_list,
     };
     pub use super::{RichTextView, TextSpan, rich_text, rich_text_signal, text_span};
     pub use super::{animated_image, animated_image_controlled, async_image, canvas};

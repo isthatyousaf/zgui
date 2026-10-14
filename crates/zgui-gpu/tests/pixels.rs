@@ -1671,12 +1671,14 @@ fn overlay_scrollbar_thumb_translates_and_clears_when_content_shrinks() {
             .map(|(i, _)| (i % 128, i / 128))
             .collect();
         match thumb_y {
+            // A rounded thumb 6 px across the 8 px track, its ends 2 px in
+            // from the 24 px its position spans.
             Some(y) => {
-                assert_eq!(visible.len(), 8 * 24);
+                assert!(visible.contains(&(116, y + 12)), "thumb at {y}: {visible:?}");
                 assert!(
                     visible
                         .iter()
-                        .all(|(x, row)| *x >= 112 && *x < 120 && *row >= y && *row < y + 24)
+                        .all(|(x, row)| *x >= 113 && *x < 119 && *row >= y + 2 && *row < y + 22)
                 );
             }
             None => assert!(visible.is_empty()),
@@ -3226,7 +3228,7 @@ fn bounded_blur_damage_distant_and_backdrop_halo_updates() {
         "small blur halo should remain local: {stats:?}"
     );
     assert_blur_matches_fresh(&gpu, &scene, 240, 160, 1.);
-    assert_eq!(stats.blur_passes, 2);
+    assert_eq!(stats.blur_passes, 3);
     assert!(stats.render_passes > stats.blur_passes);
     let after = gpu.readback().unwrap();
     let sample = (53 * 240 + 37) * 4;
@@ -4053,7 +4055,7 @@ fn clean_blur_streaming_uses_one_pass_including_isolated_layer_accounting() {
         scene.set_transform(text, Transform { x: 130., y: 120. });
         let damage = scene.flush().damage;
         let initial = gpu.render(&scene, &damage).unwrap();
-        assert_eq!(initial.blur_passes, 2);
+        assert_eq!(initial.blur_passes, 3);
         assert!(initial.render_passes > initial.blur_passes);
         for n in 1..5 {
             scene.set_kind(text, text_kind(n));
@@ -4063,7 +4065,7 @@ fn clean_blur_streaming_uses_one_pass_including_isolated_layer_accounting() {
                 // Repainted isolated layers currently redraw their whole target.
                 assert_eq!(stats.layer_repaints, 1);
                 assert_eq!(
-                    stats.blur_passes, 2,
+                    stats.blur_passes, 3,
                     "nested passes reach caller statistics"
                 );
                 assert!(stats.render_passes > stats.blur_passes + 1);
@@ -4407,10 +4409,10 @@ fn damaged_blur_batches_surrounding_draws_instead_of_one_pass_each() {
         );
         let d = s.flush().damage;
         let stats = gpu.render(&s, &d).unwrap();
-        assert_eq!(stats.blur_passes, 2);
-        // Clear+draws, the horizontal blur, then the vertical blur and the rest.
+        assert_eq!(stats.blur_passes, 3);
+        // Clear+draws, the three blur passes, then the blur drawn back and the rest.
         assert!(
-            stats.render_passes <= 3,
+            stats.render_passes <= 5,
             "{} render passes for one filter",
             stats.render_passes
         );
@@ -4664,6 +4666,46 @@ fn fade_edges_mask_descendants_with_a_quadratic_ramp() {
     assert!((half - 0.27).abs() < 0.08, "halfway {half}");
     assert_eq!(at(50), 255);
     assert_eq!(at(30), 255);
+}
+
+#[test]
+fn fade_insets_end_the_bands_inside_the_clip() {
+    // A scroll view running on under a bar: its bottom band ends 30 px above
+    // the clip's bottom, hiding what lies below.
+    let _gpu_fixture = gpu_fixture();
+    let mut scene = Scene::new(100., 100.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    scene.append(
+        scene.root(),
+        NodeKind::Rect(Color(0, 0, 0, 255)),
+        fixed(100., 100.),
+    );
+    let viewport = scene.append(
+        scene.root(),
+        NodeKind::Container(Layout::Overlay),
+        Style {
+            clip: true,
+            fade_edges: [0., 20.],
+            fade_insets: [0., 30.],
+            ..fixed(100., 100.)
+        },
+    );
+    scene.append(
+        viewport,
+        NodeKind::Rect(Color(255, 255, 255, 255)),
+        fixed(100., 100.),
+    );
+    let mut gpu = GpuRenderer::new(100, 100).unwrap();
+    let damage = scene.flush().damage;
+    gpu.render(&scene, &damage).unwrap();
+    let pixels = gpu.readback().unwrap();
+    let at = |y: usize| pixels[(y * 100 + 50) * 4];
+    assert_eq!(at(10), 255);
+    assert_eq!(at(49), 255);
+    let half = at(60) as f32 / 255.;
+    assert!((half - 0.27).abs() < 0.08, "halfway {half}");
+    assert!(at(69) < 5, "band's end {}", at(69));
+    assert_eq!(at(85), 0);
 }
 
 /// Whole-pixel scrolls shift the retained pixels and draw only the exposed
@@ -5199,4 +5241,43 @@ fn text_damage_covers_its_glyphs_and_matches_full_repaint() {
         }
     }
     let _ = view;
+}
+
+#[test]
+fn wide_backdrop_blur_matches_a_full_size_gaussian() {
+    // A 16 px blur at 2x (sigma 32) runs averaged down; across a hard edge
+    // it should still read as the exact blur, clamped inside the area.
+    let _gpu_fixture = gpu_fixture();
+    let mut gpu = GpuRenderer::new(512, 128).unwrap();
+    gpu.set_scale_factor(2.);
+    let mut s = Scene::new(256., 64.);
+    s.set_kind(s.root(), NodeKind::Container(Layout::Overlay));
+    s.append(s.root(), NodeKind::Rect(Color(0, 0, 0, 255)), fixed(256., 64.));
+    s.append(s.root(), NodeKind::Rect(Color(255, 255, 255, 255)), fixed(128., 64.));
+    let glass = s.append(s.root(), NodeKind::Rect(Color(0, 0, 0, 0)), fixed(256., 64.));
+    s.set_effects(
+        glass,
+        Effects {
+            blur_radius: 16.,
+            ..Default::default()
+        },
+    );
+    let d = s.flush().damage;
+    gpu.render(&s, &d).unwrap();
+    let pixels = gpu.readback().unwrap();
+    let sigma = 32_f64;
+    let value = |x: i64| if x.clamp(0, 511) < 256 { 255. } else { 0. };
+    let worst = (0..512_i64)
+        .map(|x| {
+            let (mut sum, mut weight) = (0., 0.);
+            for i in -96..=96_i64 {
+                let w = (-(i * i) as f64 / (2. * sigma * sigma)).exp();
+                sum += value(x + i) * w;
+                weight += w;
+            }
+            let got = pixels[((64 * 512 + x) * 4) as usize] as f64;
+            (got - sum / weight).abs()
+        })
+        .fold(0_f64, f64::max);
+    assert!(worst <= 2., "within 2/255 of the exact blur, was {worst:.2}");
 }
