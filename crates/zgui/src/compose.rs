@@ -261,6 +261,7 @@ pub struct View {
     reactive_style: Option<Box<dyn FnMut() -> Styles>>,
     disabled: Option<Box<dyn FnMut() -> bool>>,
     read_only: Option<Box<dyn FnMut() -> bool>>,
+    ime_caret: Option<Box<dyn Fn() -> crate::scene::Rect>>,
     click: Option<Box<dyn FnMut()>>,
     events: Vec<EventListener>,
     keymap: crate::actions::Keymap,
@@ -337,6 +338,7 @@ impl View {
             reactive_style: None,
             disabled: None,
             read_only: None,
+            ime_caret: None,
             click: None,
             events: Vec::new(),
             keymap: crate::actions::Keymap::new(),
@@ -459,6 +461,14 @@ impl View {
         self.read_only = Some(Box::new(read_only));
         self
     }
+    /// Let this focusable view take native IME composition, as an editor does:
+    /// it receives `ImePreedit` and `ImeCommit` events and draws the preedit
+    /// itself. `caret` returns the insertion point in the view's coordinates,
+    /// where the platform shows its candidate window. See [`Ui::accept_ime`].
+    pub fn ime_input(mut self, caret: impl Fn() -> crate::scene::Rect + 'static) -> Self {
+        self.ime_caret = Some(Box::new(caret));
+        self
+    }
     pub fn reactive_style(mut self, style: impl FnMut() -> Styles + 'static) -> Self {
         self.reactive_style = Some(Box::new(style));
         self
@@ -511,6 +521,9 @@ impl View {
         }
         if self.read_only.is_some() {
             inner.read_only = self.read_only;
+        }
+        if self.ime_caret.is_some() {
+            inner.ime_caret = self.ime_caret;
         }
         if self.click.is_some() {
             inner.click = self.click;
@@ -1526,6 +1539,10 @@ fn mount_element(
         view.read_only.is_none() || is_editor,
         "read_only is only supported on editor views"
     );
+    assert!(
+        view.ime_caret.is_none() || !is_editor,
+        "editor views already take IME input"
+    );
     if is_editor {
         assert!(
             view.children.is_empty(),
@@ -2052,6 +2069,9 @@ fn mount_element(
     }
     if let Some((value, range)) = slider_state {
         mount_slider(ui, root, value, range, environment.typography.clone());
+    }
+    if let Some(caret) = view.ime_caret.take() {
+        ui.accept_ime(root, caret);
     }
     if let Some(editor) = editor {
         if let Some(mut read_only) = view.read_only.take() {

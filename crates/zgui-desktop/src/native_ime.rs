@@ -2,7 +2,7 @@
 use winit::event::Ime;
 use zgui::{
     input::InputEvent,
-    scene::NodeId,
+    scene::{NodeId, Rect},
     widgets::{LayoutFeedbackError, Ui},
 };
 
@@ -46,6 +46,20 @@ pub(crate) fn editable_editor(
         .then(|| ui.focused_editor())
         .flatten()
         .filter(|editor| !editor.is_read_only())
+}
+
+/// The node that takes native composition: a writable editor, or a view
+/// registered with `Ui::accept_ime`.
+pub(crate) fn ime_target(ui: &Ui, native_focused: bool) -> Option<NodeId> {
+    ime_caret(ui, native_focused).map(|(node, _)| node)
+}
+
+/// The composition target and its caret, where the candidate window goes.
+pub(crate) fn ime_caret(ui: &Ui, native_focused: bool) -> Option<(NodeId, Rect)> {
+    if let Some(editor) = editable_editor(ui, native_focused) {
+        return Some((editor.node, ui.scene.borrow().bounds(editor.caret)));
+    }
+    native_focused.then(|| ui.focused_ime_input()).flatten()
 }
 
 /// A reset must cross both native context notifications before accepting text.
@@ -116,7 +130,7 @@ impl CancellationTracker {
                 editor.editor.borrow().composition_cancel_revision(),
             )
         });
-        if current.is_none() {
+        if ime_target(ui, true).is_none() {
             *active = false;
         }
         let previous = std::mem::replace(&mut self.observed, current);
@@ -154,10 +168,7 @@ pub(crate) fn dispatch(
     session_target: Option<NodeId>,
     event: Ime,
 ) -> Result<Option<bool>, LayoutFeedbackError> {
-    if !native_focused
-        || session_target.is_none()
-        || session_target != editable_editor(ui, true).map(|editor| editor.node)
-    {
+    if !native_focused || session_target.is_none() || session_target != ime_target(ui, true) {
         return Ok(None);
     }
     let event = match event {
@@ -169,18 +180,77 @@ pub(crate) fn dispatch(
         Ime::Preedit(text, cursor) => InputEvent::ImePreedit { text, cursor },
         Ime::Commit(text) => InputEvent::ImeCommit(text),
     };
+    let preedit = matches!(&event, InputEvent::ImePreedit { text, .. } if !text.is_empty());
     let result = ui.try_dispatch(event)?;
     // Custom handlers may reject or replace preedit. Keyboard suppression must
     // follow the editor's actual state, not the text of the incoming event.
-    Ok(Some(
-        !result.focus_changed && composition_target(ui) == session_target,
-    ))
+    // A view that accepts IME keeps its own preedit, so its events decide.
+    let composing = if editable_editor(ui, true).is_some() {
+        composition_target(ui) == session_target
+    } else {
+        preedit
+    };
+    Ok(Some(!result.focus_changed && composing))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::focus_memory::FocusMemory;
+
+    #[test]
+    fn a_view_that_accepts_ime_receives_composition_and_places_the_caret() {
+        use std::{cell::RefCell, rc::Rc};
+        use zgui::scene::{Insets, Layout, Style};
+        let mut ui = Ui::new(400., 200.);
+        let style = Style {
+            width: Some(100.),
+            height: Some(40.),
+            margin: Insets {
+                left: 30.,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let node = ui.container(ui.root(), Layout::Column, style);
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let log = received.clone();
+        ui.on_event(node, true, move |cx| {
+            log.borrow_mut().push(cx.event.clone())
+        });
+        ui.input.focus(&ui.scene, Some(node));
+        ui.prepare_frame();
+        assert_eq!(ime_target(&ui, true), None, "not registered yet");
+
+        ui.accept_ime(node, || Rect::new(8., 17., 8., 17.));
+        assert_eq!(
+            ime_caret(&ui, true),
+            Some((node, Rect::new(38., 17., 8., 17.)))
+        );
+        assert_eq!(ime_target(&ui, false), None);
+        let mut tracker = CancellationTracker::default();
+        let mut barrier = RestartBarrier::default();
+        let preedit = Ime::Preedit("中".into(), None);
+        let mut active = dispatch(&mut ui, true, Some(node), preedit)
+            .unwrap()
+            .unwrap();
+        assert!(active, "keys are held back while composing");
+        tracker.sync(&ui, true, Some(node), &mut barrier, &mut active);
+        assert!(active, "composition survives the next frame");
+        let commit = Ime::Commit("中".into());
+        assert_eq!(
+            dispatch(&mut ui, true, Some(node), commit).unwrap(),
+            Some(false)
+        );
+        assert!(
+            received
+                .borrow()
+                .contains(&InputEvent::ImeCommit("中".into()))
+        );
+
+        ui.remove(node);
+        assert_eq!(ime_target(&ui, true), None);
+    }
 
     #[test]
     fn rapid_read_only_toggle_keeps_native_reset_boundary() {

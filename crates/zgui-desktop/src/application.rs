@@ -863,8 +863,7 @@ impl Host {
     fn sync_ime_cancellation(&mut self) {
         // Update native permission before event delivery and before hidden-window
         // drawing gates. Read-only editors retain logical focus but no IME context.
-        let target = crate::native_ime::editable_editor(&self.context.ui, self.native_focused)
-            .map(|editor| editor.node);
+        let target = crate::native_ime::ime_target(&self.context.ui, self.native_focused);
         if let Some(window) = &self.window
             && target != self.ime_target
         {
@@ -1020,8 +1019,7 @@ impl Host {
             window.set_cursor(cursor);
             self.native_cursor = Some(cursor);
         }
-        let editor = crate::native_ime::editable_editor(ui, self.native_focused);
-        let caret = editor.map(|editor| ui.scene.borrow().bounds(editor.caret));
+        let caret = crate::native_ime::ime_caret(ui, self.native_focused).map(|(_, caret)| caret);
         if caret != self.ime_geometry {
             if let Some(r) = caret {
                 // XIM takes a baseline spot and ignores the supplied rectangle

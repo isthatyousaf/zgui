@@ -330,6 +330,8 @@ impl EditorDrag {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
 }
+/// See [`Ui::accept_ime`].
+type ImeCaret = Rc<dyn Fn() -> Rect>;
 struct UiStorage {
     runtime: Runtime,
     text_geometry_revision: Signal<u64>,
@@ -339,6 +341,7 @@ struct UiStorage {
     semantics: Rc<RefCell<Semantics>>,
     owned: RefCell<HashMap<NodeId, Owned>>,
     editors: RefCell<HashMap<NodeId, EditorHandle>>,
+    ime_inputs: RefCell<HashMap<NodeId, ImeCaret>>,
     editor_layout: RefCell<Option<EditorLayoutEntry>>,
     editor_layout_revision: Cell<Option<u64>>,
     bounds_geometry_revision: Cell<Option<u64>>,
@@ -449,6 +452,7 @@ impl Ui {
             semantics: Rc::new(RefCell::new(Semantics::new())),
             owned: RefCell::new(HashMap::new()),
             editors: RefCell::new(HashMap::new()),
+            ime_inputs: RefCell::new(HashMap::new()),
             editor_layout: RefCell::new(None),
             editor_layout_revision: Cell::new(None),
             bounds_geometry_revision: Cell::new(None),
@@ -1129,6 +1133,37 @@ impl Ui {
             .focused()
             .and_then(|id| self.storage.editors.borrow().get(&id).cloned())
     }
+    /// Let a focusable node that is not an editor take native IME composition.
+    /// While it has focus, the desktop host enables the platform input method,
+    /// sends it `ImePreedit` and `ImeCommit` events, and holds back key events
+    /// during composition, as for an editor. The node draws its own preedit.
+    /// `caret` returns the insertion point in the node's own coordinates; the
+    /// host places the candidate window there. Removing the node unregisters it.
+    pub fn accept_ime(&self, node: NodeId, caret: impl Fn() -> Rect + 'static) {
+        let old = self
+            .storage
+            .ime_inputs
+            .borrow_mut()
+            .insert(node, Rc::new(caret));
+        drop(old);
+    }
+    /// The focused node registered with [`Ui::accept_ime`], and its caret in
+    /// window coordinates.
+    pub fn focused_ime_input(&self) -> Option<(NodeId, Rect)> {
+        let node = self.input.focused()?;
+        let caret = self.storage.ime_inputs.borrow().get(&node).cloned()?;
+        let local = caret();
+        let bounds = self.scene.borrow().bounds(node);
+        Some((
+            node,
+            Rect::new(
+                bounds.x + local.x,
+                bounds.y + local.y,
+                local.width,
+                local.height,
+            ),
+        ))
+    }
     pub fn dispatch(&mut self, event: InputEvent) -> crate::input::DispatchResult {
         self.try_dispatch(event)
             .unwrap_or_else(|error| panic!("{error}"))
@@ -1310,6 +1345,10 @@ impl Ui {
             let mut storage = self.storage.editors.borrow_mut();
             ids.iter().filter_map(|id| storage.remove(id)).collect()
         };
+        let ime_inputs: Vec<_> = {
+            let mut storage = self.storage.ime_inputs.borrow_mut();
+            ids.iter().filter_map(|id| storage.remove(id)).collect()
+        };
         // Detach geometry before listener captures or cached layouts can run
         // user destructors. Reentrant removal of this owner (or an ancestor)
         // then observes an already removed subtree instead of stale node IDs.
@@ -1324,6 +1363,7 @@ impl Ui {
         drop(cached_layout);
         drop(owned);
         drop(editors);
+        drop(ime_inputs);
     }
 }
 pub fn fixed(width: f32, height: f32) -> Style {
@@ -2672,6 +2712,21 @@ mod content_size_observer_tests {
         assert!(!ui.scene.borrow().contains(child));
         assert!(ui.storage.content_sizes.borrow().is_empty());
         ui.prepare_frame();
+    }
+}
+
+#[cfg(test)]
+mod ime_input_tests {
+    use super::*;
+
+    #[test]
+    fn removing_a_node_unregisters_its_ime_input() {
+        let mut ui = Ui::new(100., 100.);
+        let parent = ui.container(ui.root(), Layout::Column, Style::default());
+        let node = ui.container(parent, Layout::Column, Style::default());
+        ui.accept_ime(node, Rect::default);
+        ui.remove(parent);
+        assert!(ui.storage.ime_inputs.borrow().is_empty());
     }
 }
 
