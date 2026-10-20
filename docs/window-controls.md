@@ -7,6 +7,7 @@
 let window = cx.window.clone();
 window.set_title("Notes — saved");
 window.set_inner_size(800., 600.); // logical client dimensions
+window.set_zoom(1.25); // draw content 25% larger, like browser zoom
 window.set_maximized(true);
 window.set_minimized(false);
 window.set_visible(true);
@@ -16,7 +17,9 @@ window.request_focus();
 
 Title, size, visibility, and requested minimize/maximize state survive suspension and native recreation. Commands also work while a newly opened window is awaiting construction. A focus request made without a native window is delivered once after creation. Closed handles ignore subsequent requests. Updating the title invalidates the accessible window title as well.
 
-Size requests reject zero, negative, nonfinite, or dimensions exceeding `u32::MAX`. The operating system can constrain any request. Observe `WindowContext::viewport` for actual logical client dimensions; receiving a command is not confirmation that the window manager accepted it. Native resize and scale events update the size used for recreation.
+Size requests reject zero, negative, nonfinite, or dimensions exceeding `u32::MAX`. The operating system can constrain any request. Observe `WindowContext::viewport` for actual logical client dimensions (divided by the zoom, if one is set); receiving a command is not confirmation that the window manager accepted it. Native resize and scale events update the size used for recreation.
+
+`set_zoom` multiplies the display scale factor for this window's content: text and SVGs rasterize at the new device size, and pointer, wheel, IME, file-drop and accessibility coordinates follow it. The native window keeps its size, so `WindowContext::viewport` reports the window size divided by the zoom. Zoom is clamped to 0.25–5, ignores nonfinite values, and survives native recreation. It binds no shortcuts; applications choose their own keys.
 
 Winit currently does not implement dynamic visibility or focus requests on Wayland, and Wayland cannot programmatically unminimize. Focus requests on other platforms can also be rejected by focus-stealing prevention. Minimize/maximize recreation state records application requests; it does not promise to mirror every window-manager action.
 

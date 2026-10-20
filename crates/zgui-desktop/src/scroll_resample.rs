@@ -91,6 +91,21 @@ impl ScrollResampler {
         self.wheel.0 += delta.0;
         self.wheel.1 += delta.1;
     }
+    /// Convert buffered motion and the pointer position to new layout units,
+    /// `ratio` new units per old unit (after a zoom change).
+    pub fn rescale(&mut self, ratio: f32) {
+        let scale = |point: &mut (f32, f32)| {
+            point.0 *= ratio;
+            point.1 *= ratio;
+        };
+        for (_, point) in &mut self.points {
+            scale(point);
+        }
+        scale(&mut self.received);
+        scale(&mut self.applied);
+        scale(&mut self.wheel);
+        scale(&mut self.position);
+    }
     /// Deliver everything at once (no display refreshes are coming).
     pub fn flush(&mut self) -> Option<(f32, f32)> {
         let delta = (
@@ -241,6 +256,20 @@ mod tests {
         assert!((total - 84.).abs() < 1e-3);
         assert!(steps[0] > steps[3], "{steps:?}");
         assert!(!resampler.pending());
+    }
+
+    #[test]
+    fn rescale_converts_buffered_motion_and_position() {
+        let start = Instant::now();
+        let mut resampler = ScrollResampler {
+            position: (100., 40.),
+            ..Default::default()
+        };
+        resampler.push_precise(start, (3., 5.));
+        resampler.push_wheel(start, (0., 28.));
+        resampler.rescale(0.5);
+        assert_eq!(resampler.position, (50., 20.));
+        assert_eq!(resampler.flush(), Some((1.5, 16.5)));
     }
 
     #[test]

@@ -106,6 +106,7 @@ enum WindowCommand {
     Visible(bool),
     Focus,
     MaxFrameRate(Option<f64>),
+    Zoom(f64),
 }
 #[derive(Debug)]
 struct WindowState {
@@ -113,6 +114,9 @@ struct WindowState {
     minimized: bool,
     maximized: bool,
     focus_requested: bool,
+    /// Content zoom (see `WindowHandle::set_zoom`). Kept with the other
+    /// recreation state so it also reaches windows that are still pending.
+    zoom: f64,
 }
 impl Default for WindowState {
     fn default() -> Self {
@@ -121,6 +125,7 @@ impl Default for WindowState {
             minimized: false,
             maximized: false,
             focus_requested: false,
+            zoom: 1.,
         }
     }
 }
@@ -132,6 +137,7 @@ impl WindowState {
             WindowCommand::Decorations(value) => options.decorations = *value,
             WindowCommand::MinSize(value) => options.min_size = *value,
             WindowCommand::Drag | WindowCommand::RefreshInfo => {}
+            WindowCommand::Zoom(zoom) => self.zoom = *zoom,
             WindowCommand::Title(title) => options.title.clone_from(title),
             WindowCommand::Size(width, height) => {
                 options.width = *width;
@@ -144,6 +150,12 @@ impl WindowState {
             WindowCommand::MaxFrameRate(hz) => options.max_frame_rate = *hz,
         }
     }
+}
+/// Content zoom range accepted by `WindowHandle::set_zoom` (browsers use the same).
+const ZOOM_RANGE: std::ops::RangeInclusive<f64> = 0.25..=5.;
+fn valid_zoom(zoom: f64) -> Option<f64> {
+    zoom.is_finite()
+        .then(|| zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end()))
 }
 fn valid_window_size(width: f64, height: f64) -> bool {
     [width, height]
@@ -241,7 +253,8 @@ impl WindowHandle {
         self.command(WindowCommand::Title(title.into()));
     }
     /// Request a logical client size. Invalid dimensions are ignored. The compositor
-    /// may constrain the request; `WindowContext::viewport` reports the actual size.
+    /// may constrain the request; `WindowContext::viewport` reports the actual size
+    /// divided by the zoom (see [`WindowHandle::set_zoom`]).
     pub fn set_inner_size(&self, width: f64, height: f64) {
         if valid_window_size(width, height) {
             self.command(WindowCommand::Size(width, height));
@@ -259,6 +272,16 @@ impl WindowHandle {
     /// Wayland does not support changing visibility after creation.
     pub fn set_visible(&self, visible: bool) {
         self.command(WindowCommand::Visible(visible));
+    }
+    /// Scale this window's content, like browser zoom: 1.0 is the display's normal
+    /// size and 2.0 draws everything twice as large. The window keeps its size;
+    /// `WindowContext::viewport` (the layout size) changes by the inverse factor.
+    /// Values are clamped to 0.25–5 and nonfinite values are ignored. The zoom
+    /// survives native recreation.
+    pub fn set_zoom(&self, zoom: f64) {
+        if let Some(zoom) = valid_zoom(zoom) {
+            self.command(WindowCommand::Zoom(zoom));
+        }
     }
     /// Cap animation frames per second, or `None` to follow the display.
     pub fn set_max_frame_rate(&self, hz: Option<f64>) {
@@ -628,7 +651,11 @@ struct Host {
     ime_cancellation: crate::native_ime::CancellationTracker,
     native_focused: bool,
     x11: bool,
+    /// The display's scale factor. Window geometry exchanged with the OS
+    /// (requested sizes, minimum sizes) uses these units.
     scale_factor: f64,
+    /// Content moved under a still pointer; `update` hit-tests it again.
+    rehover: bool,
     force: bool,
     presentation: Presentation,
     native_occluded: bool,
@@ -760,6 +787,7 @@ impl Host {
             native_focused: false,
             x11: false,
             scale_factor: 1.,
+            rehover: false,
             force: true,
             presentation: Presentation::default(),
             native_occluded: false,
@@ -788,6 +816,10 @@ impl Host {
             ime_target: None,
         }
     }
+    /// Device pixels per layout unit: the display scale times the content zoom.
+    fn content_scale(&self) -> f64 {
+        self.scale_factor * self.state.zoom
+    }
     fn dispatch(&mut self, event: InputEvent) -> Result<(), zgui::widgets::LayoutFeedbackError> {
         self.dispatch_prevented(event).map(|_| ())
     }
@@ -814,6 +846,7 @@ impl Host {
         }
         self.last_accessibility = Some(state);
         self.accessibility_geometry_dirty = false;
+        let scale = self.content_scale();
         if let (Some(adapter), Some(_)) = (&mut self.adapter, &self.window) {
             let ui = &self.context.ui;
             adapter.update_if_active(|| {
@@ -822,7 +855,7 @@ impl Host {
                     &ui.semantics.borrow(),
                     ui.input.focused(),
                     &self.options.title,
-                    self.scale_factor,
+                    scale,
                 )
             });
         }
@@ -996,9 +1029,9 @@ impl Host {
                 let y = if self.x11 { r.y + r.height } else { r.y };
                 window.set_ime_cursor_area(
                     LogicalPosition::new(r.x as f64, y as f64)
-                        .to_physical::<f64>(self.scale_factor),
+                        .to_physical::<f64>(self.content_scale()),
                     LogicalSize::new(r.width.max(1.) as f64, r.height as f64)
-                        .to_physical::<f64>(self.scale_factor),
+                        .to_physical::<f64>(self.content_scale()),
                 );
             }
             self.ime_geometry = caret;
@@ -1145,7 +1178,7 @@ impl Host {
             }
         };
         self.scale_factor = window.scale_factor();
-        renderer.set_scale_factor(self.scale_factor as f32);
+        renderer.set_scale_factor(self.content_scale() as f32);
         renderer.set_background(if self.options.transparent {
             zgui::scene::Color(0, 0, 0, 0)
         } else {
@@ -1216,7 +1249,67 @@ impl Host {
         self.last_accessibility = None;
         Ok(())
     }
+    fn set_zoom(&mut self, zoom: f64) {
+        let old = self.state.zoom;
+        if zoom == old {
+            return;
+        }
+        self.state.zoom = zoom;
+        // Gestures in progress (presses, drags) hold positions in the old layout
+        // units; any later move, real or the rehover below, would misread them.
+        self.context.ui.cancel_interactions();
+        // Pointer and buffered scroll input are kept in layout units, which the
+        // zoom rescales.
+        let ratio = (old / zoom) as f32;
+        self.cursor.0 *= ratio;
+        self.cursor.1 *= ratio;
+        self.scroll.rescale(ratio);
+        // Lay out against the size the window has. `options` can hold a
+        // requested size that is still pending or was declined.
+        let mut sized = false;
+        if let Some(size) = self.window.as_ref().map(|window| window.inner_size())
+            && apply_viewport(
+                &mut self.options,
+                &self.context.ui,
+                &self.context.viewport,
+                size,
+                self.scale_factor,
+                zoom,
+            )
+        {
+            if let Some(renderer) = &mut self.renderer {
+                renderer.resize(size.width, size.height);
+            }
+            sized = true;
+        }
+        if !sized {
+            // No native window yet (`create_window` applies the scale), or a
+            // zero size: use the last known window size.
+            resize_content(
+                &self.options,
+                &self.context.ui,
+                &self.context.viewport,
+                zoom,
+            );
+        }
+        let scale = self.content_scale();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_scale_factor(scale as f32);
+            self.context.ui.refresh_text_geometry();
+        }
+        self.rehover = self.pointer_inside;
+        self.ime_geometry = None;
+        self.accessibility_geometry_dirty = true;
+        self.force = true;
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
     fn command(&mut self, command: WindowCommand) {
+        if let WindowCommand::Zoom(zoom) = command {
+            self.set_zoom(zoom);
+            return;
+        }
         self.state.apply(&mut self.options, &command);
         if matches!(command, WindowCommand::Title(_)) {
             self.last_accessibility = None;
@@ -1276,6 +1369,7 @@ impl Host {
                     &self.context.viewport,
                     size,
                     self.scale_factor,
+                    self.state.zoom,
                 ) {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(size.width, size.height);
@@ -1312,6 +1406,8 @@ impl Host {
                 window.focus_window();
                 self.state.focus_requested = false;
             }
+            // Handled before `WindowState::apply`; see `set_zoom`.
+            WindowCommand::Zoom(_) => {}
             // Applies without a native window too: the clock outlives it.
             WindowCommand::MaxFrameRate(_) => {}
         }
@@ -1435,13 +1531,13 @@ impl Host {
                 if size.width > 0 && size.height > 0 {
                     self.presentation.expose();
                 }
-                let scale = self.scale_factor;
                 if apply_viewport(
                     &mut self.options,
                     &self.context.ui,
                     &self.context.viewport,
                     size,
-                    scale,
+                    self.scale_factor,
+                    self.state.zoom,
                 ) {
                     if let Some(renderer) = &mut self.renderer {
                         renderer.resize(size.width, size.height);
@@ -1464,8 +1560,9 @@ impl Host {
                     self.cursor.1 *= ratio;
                 }
                 self.scale_factor = scale_factor;
+                let scale = self.content_scale();
                 if let Some(renderer) = &mut self.renderer {
-                    renderer.set_scale_factor(scale_factor as f32);
+                    renderer.set_scale_factor(scale as f32);
                 }
                 // The native resize follows this notification. Applying the
                 // new scale to the old physical size creates a false logical resize.
@@ -1483,7 +1580,7 @@ impl Host {
                 };
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let p = position.to_logical::<f32>(self.scale_factor);
+                let p = position.to_logical::<f32>(self.content_scale());
                 self.cursor = (p.x, p.y);
                 self.pointer_inside = true;
                 self.dispatch(InputEvent::PointerMove { x: p.x, y: p.y })?;
@@ -1523,7 +1620,7 @@ impl Host {
                 })?;
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = wheel_delta(delta, self.scale_factor);
+                let (dx, dy) = wheel_delta(delta, self.content_scale());
                 if crate::scroll_resample::enabled() {
                     // Applied on display refreshes; see `update`.
                     let now = std::time::Instant::now();
@@ -1616,6 +1713,11 @@ impl Host {
     }
     fn update(&mut self) -> Result<bool, Box<dyn Error>> {
         self.poll_frame_deadline(std::time::Instant::now());
+        // A zoom moved content under a still pointer: update hover and cursor.
+        if std::mem::take(&mut self.rehover) && self.pointer_inside {
+            let (x, y) = self.cursor;
+            self.dispatch(InputEvent::PointerMove { x, y })?;
+        }
         if self.scroll.pending() {
             // Each refresh applies the motion due by then; with no refreshes
             // coming (hidden, minimized), everything applies at once.
@@ -1882,6 +1984,15 @@ impl WindowManager {
             let token = request.handle.token;
             let mut host = Host::new(request.options, request.handle, self.factory.clone());
             host.state = request.state;
+            // Zoom requested while the window was pending.
+            if host.state.zoom != 1. {
+                resize_content(
+                    &host.options,
+                    &host.context.ui,
+                    &host.context.viewport,
+                    host.state.zoom,
+                );
+            }
             (request.build)(&mut host.context);
             if host.context.window.is_closed() {
                 continue;
@@ -2006,13 +2117,21 @@ impl ApplicationHandler<Event> for WindowManager {
                     && !host.context.window.is_closed()
                 {
                     use crate::wayland_files::FileEvent;
+                    // Positions arrive in window units; layout units divide by the zoom.
+                    let zoom = host.state.zoom as f32;
                     let result = match event {
-                        FileEvent::Hover { x, y, path } => {
-                            host.dispatch(InputEvent::FileHover { x, y, path })
-                        }
+                        FileEvent::Hover { x, y, path } => host.dispatch(InputEvent::FileHover {
+                            x: x / zoom,
+                            y: y / zoom,
+                            path,
+                        }),
                         FileEvent::Leave => host.dispatch(InputEvent::FileHoverCancelled),
                         FileEvent::Rejected { x, y, reason } => {
-                            host.dispatch(InputEvent::FilesDropRejected { x, y, reason })
+                            host.dispatch(InputEvent::FilesDropRejected {
+                                x: x / zoom,
+                                y: y / zoom,
+                                reason,
+                            })
                         }
                         FileEvent::Drop {
                             x,
@@ -2020,6 +2139,7 @@ impl ApplicationHandler<Event> for WindowManager {
                             paths,
                             accepted,
                         } => {
+                            let (x, y) = (x / zoom, y / zoom);
                             let mut result = Ok(());
                             let mut handled = false;
                             for path in paths.iter() {
@@ -2322,6 +2442,7 @@ fn apply_viewport(
     viewport: &Signal<(f32, f32)>,
     size: PhysicalSize<u32>,
     scale: f64,
+    zoom: f64,
 ) -> bool {
     if size.width == 0 || size.height == 0 || !scale.is_finite() || scale <= 0. {
         return false;
@@ -2335,11 +2456,20 @@ fn apply_viewport(
     {
         return false;
     }
+    // Native recreation uses the window size; the zoom only changes the layout.
     options.width = width;
     options.height = height;
-    ui.scene.borrow_mut().resize(width as f32, height as f32);
-    viewport.set((width as f32, height as f32));
+    resize_content(options, ui, viewport, zoom);
     true
+}
+/// Size the layout to the window size divided by the content zoom.
+fn resize_content(options: &WindowOptions, ui: &Ui, viewport: &Signal<(f32, f32)>, zoom: f64) {
+    let (width, height) = (
+        (options.width / zoom) as f32,
+        (options.height / zoom) as f32,
+    );
+    ui.scene.borrow_mut().resize(width, height);
+    viewport.set((width, height));
 }
 fn native_cursor(cursor: zgui::cursor::Cursor) -> CursorIcon {
     use zgui::cursor::Cursor as C;
@@ -2487,7 +2617,8 @@ mod tests {
             &ui,
             &viewport,
             PhysicalSize::new(1800, 1200),
-            2.
+            2.,
+            1.
         ));
         assert_eq!((options.width, options.height), (900., 600.));
         assert_eq!(viewport.get(), (900., 600.));
@@ -2498,14 +2629,16 @@ mod tests {
             &ui,
             &viewport,
             PhysicalSize::new(0, 0),
-            2.
+            2.,
+            1.
         ));
         assert!(!apply_viewport(
             &mut options,
             &ui,
             &viewport,
             PhysicalSize::new(1800, 1200),
-            0.
+            0.,
+            1.
         ));
         assert_eq!((options.width, options.height), (900., 600.));
         assert!(apply_viewport(
@@ -2513,10 +2646,49 @@ mod tests {
             &ui,
             &viewport,
             PhysicalSize::new(1800, 1200),
-            1.5
+            1.5,
+            1.
         ));
         assert_eq!((options.width, options.height), (1200., 800.));
         assert_eq!(viewport.get(), (1200., 800.));
+    }
+    #[test]
+    fn zoom_scales_layout_but_keeps_the_window_size_for_recreation() {
+        let mut options = WindowOptions::default();
+        let ui = Ui::new(960., 720.);
+        let viewport = ui.signal((960., 720.));
+        assert!(apply_viewport(
+            &mut options,
+            &ui,
+            &viewport,
+            PhysicalSize::new(1800, 1200),
+            1.5,
+            2.
+        ));
+        assert_eq!((options.width, options.height), (1200., 800.));
+        assert_eq!(viewport.get(), (600., 400.));
+        ui.scene.borrow_mut().prepare_layout();
+        assert_eq!(ui.scene.borrow().bounds(ui.root()).width, 600.);
+        resize_content(&options, &ui, &viewport, 0.5);
+        assert_eq!((options.width, options.height), (1200., 800.));
+        assert_eq!(viewport.get(), (2400., 1600.));
+    }
+    #[test]
+    fn pending_window_state_keeps_the_requested_zoom() {
+        let mut state = WindowState::default();
+        let mut options = WindowOptions::default();
+        assert_eq!(state.zoom, 1.);
+        state.apply(&mut options, &WindowCommand::Zoom(1.5));
+        assert_eq!(state.zoom, 1.5);
+    }
+    #[test]
+    fn zoom_requests_are_clamped_and_reject_nonfinite_values() {
+        assert_eq!(valid_zoom(1.25), Some(1.25));
+        assert_eq!(valid_zoom(0.01), Some(0.25));
+        assert_eq!(valid_zoom(-3.), Some(0.25));
+        assert_eq!(valid_zoom(50.), Some(5.));
+        assert_eq!(valid_zoom(f64::NAN), None);
+        assert_eq!(valid_zoom(f64::INFINITY), None);
     }
     #[test]
     fn native_cursor_roles_distinguish_editable_and_actionable_controls() {
