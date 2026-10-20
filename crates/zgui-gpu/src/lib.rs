@@ -3217,6 +3217,10 @@ impl GpuRenderer {
             self.texture_uploads
                 .push(&texture, (0, 0, image.width(), image.height()), &pixels);
         } else {
+            // A raw copy into the BGRA texture (see `FORMAT`) must match its byte order.
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
             self.queue.write_texture(
                 texture.as_image_copy(),
                 &pixels,
@@ -3377,6 +3381,10 @@ impl GpuRenderer {
                 &rgba,
             );
         } else {
+            // A raw copy into the BGRA atlas (see `FORMAT`) must match its byte order.
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel.swap(0, 2);
+            }
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &self.atlas,
