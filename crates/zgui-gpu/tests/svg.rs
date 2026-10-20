@@ -183,3 +183,39 @@ fn atlas_icons_survive_the_atlas_filling_up() {
         }
     }
 }
+#[test]
+fn icons_shown_again_after_a_scale_change_use_fresh_atlas_cells() {
+    // A scale change restarts atlas packing, so the 2x frame packs over the 1x
+    // icon's cell. Back at 1x, that icon must not reuse its old cell.
+    let mut scene = Scene::new(60., 40.);
+    scene.set_kind(scene.root(), NodeKind::Container(Layout::Overlay));
+    let node = scene.append(
+        scene.root(),
+        NodeKind::Svg(data()),
+        Style {
+            width: Some(20.),
+            height: Some(10.),
+            ..Default::default()
+        },
+    );
+    scene.set_transform(node, Transform { x: 10., y: 10. });
+    scene.flush();
+    let full = [Rect::new(0., 0., 60., 40.)];
+    let mut gpu = GpuRenderer::new(60, 40).unwrap();
+    gpu.render(&scene, &full).unwrap();
+    let expected = gpu.readback().unwrap();
+    // The green right half of the icon.
+    assert_eq!(&expected[(15 * 60 + 25) * 4..][..3], &[0, 128, 0]);
+    gpu.set_scale_factor(2.);
+    gpu.render(&scene, &full).unwrap();
+    gpu.set_scale_factor(1.);
+    gpu.render(&scene, &full).unwrap();
+    assert_eq!(
+        &gpu.readback().unwrap()[(15 * 60 + 25) * 4..][..3],
+        &[0, 128, 0]
+    );
+    assert!(
+        gpu.readback().unwrap() == expected,
+        "1x frame differs after a 2x frame"
+    );
+}

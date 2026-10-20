@@ -1215,7 +1215,9 @@ impl GpuRenderer {
             self.scale = scale;
             self.layers.clear();
             self.shapes.clear();
+            // Packing restarts at the atlas origin, so every cached cell is stale.
             self.entries.clear();
+            self.image_cells.clear();
             self.atlas_epoch = self.atlas_epoch.wrapping_add(1);
             self.cursor = (0, 0, 0);
             self.fresh = true;
