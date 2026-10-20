@@ -49,9 +49,13 @@ pub(crate) fn editable_editor(
 }
 
 /// The node that takes native composition: a writable editor, or a view
-/// registered with `Ui::accept_ime`.
+/// registered with `Ui::accept_ime`. Runs no app code: hosts call it several
+/// times per event and frame, and only [`ime_caret`] needs the caret.
 pub(crate) fn ime_target(ui: &Ui, native_focused: bool) -> Option<NodeId> {
-    ime_caret(ui, native_focused).map(|(node, _)| node)
+    if let Some(editor) = editable_editor(ui, native_focused) {
+        return Some(editor.node);
+    }
+    native_focused.then(|| ui.focused_ime_node()).flatten()
 }
 
 /// The composition target and its caret, where the candidate window goes.
@@ -250,6 +254,33 @@ mod tests {
 
         ui.remove(node);
         assert_eq!(ime_target(&ui, true), None);
+    }
+
+    #[test]
+    fn the_ime_target_is_found_without_running_the_caret_closure() {
+        use std::{cell::Cell, rc::Rc};
+        use zgui::scene::{Layout, Style};
+        let mut ui = Ui::new(400., 200.);
+        let style = Style {
+            width: Some(100.),
+            height: Some(40.),
+            ..Default::default()
+        };
+        let node = ui.container(ui.root(), Layout::Column, style);
+        // A focusable listener, so the node can take focus.
+        ui.on_event(node, true, |_| {});
+        let calls = Rc::new(Cell::new(0));
+        let counted = calls.clone();
+        ui.accept_ime(node, move || {
+            counted.set(counted.get() + 1);
+            Rect::new(0., 0., 8., 17.)
+        });
+        ui.input.focus(&ui.scene, Some(node));
+        ui.prepare_frame();
+        assert_eq!(ime_target(&ui, true), Some(node));
+        assert_eq!(calls.get(), 0, "the target needs no caret");
+        assert!(ime_caret(&ui, true).is_some());
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]

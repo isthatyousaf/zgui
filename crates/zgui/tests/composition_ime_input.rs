@@ -22,3 +22,13 @@ fn ime_input_views_report_their_caret_while_focused_and_unregister_on_unmount() 
     mounted.unmount();
     assert_eq!(ui.focused_ime_input(), None);
 }
+
+#[test]
+#[should_panic(expected = "cannot accept IME on a removed UI node")]
+fn accepting_ime_on_a_removed_node_panics() {
+    let mut ui = Ui::new(400., 300.);
+    let mounted = ui.mount(div().id("input").focusable(true));
+    let node = mounted.find("input").unwrap();
+    mounted.unmount();
+    ui.accept_ime(node, Rect::default);
+}

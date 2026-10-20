@@ -1139,7 +1139,15 @@ impl Ui {
     /// during composition, as for an editor. The node draws its own preedit.
     /// `caret` returns the insertion point in the node's own coordinates; the
     /// host places the candidate window there. Removing the node unregisters it.
+    ///
+    /// The node must clear its own preedit on `Blur`: when focus moves during
+    /// composition, it gets no event that ends the composition (editors call
+    /// `cancel_preedit` on `Blur` for the same reason).
     pub fn accept_ime(&self, node: NodeId, caret: impl Fn() -> Rect + 'static) {
+        assert!(
+            self.scene.borrow().contains(node),
+            "cannot accept IME on a removed UI node"
+        );
         let old = self
             .storage
             .ime_inputs
@@ -1147,10 +1155,21 @@ impl Ui {
             .insert(node, Rc::new(caret));
         drop(old);
     }
-    /// The focused node registered with [`Ui::accept_ime`], and its caret in
-    /// window coordinates.
-    pub fn focused_ime_input(&self) -> Option<(NodeId, Rect)> {
+    /// The focused node, if it is registered with [`Ui::accept_ime`]. Unlike
+    /// [`Ui::focused_ime_input`], this runs no app code.
+    pub fn focused_ime_node(&self) -> Option<NodeId> {
         let node = self.input.focused()?;
+        self.storage
+            .ime_inputs
+            .borrow()
+            .contains_key(&node)
+            .then_some(node)
+    }
+    /// The focused node registered with [`Ui::accept_ime`], and its caret in
+    /// layout (scene) coordinates. Hosts multiply by their content scale to
+    /// get window pixels.
+    pub fn focused_ime_input(&self) -> Option<(NodeId, Rect)> {
+        let node = self.focused_ime_node()?;
         let caret = self.storage.ime_inputs.borrow().get(&node).cloned()?;
         let local = caret();
         let bounds = self.scene.borrow().bounds(node);

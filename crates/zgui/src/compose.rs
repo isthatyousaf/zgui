@@ -464,7 +464,9 @@ impl View {
     /// Let this focusable view take native IME composition, as an editor does:
     /// it receives `ImePreedit` and `ImeCommit` events and draws the preedit
     /// itself. `caret` returns the insertion point in the view's coordinates,
-    /// where the platform shows its candidate window. See [`Ui::accept_ime`].
+    /// where the platform shows its candidate window. Clear the preedit on
+    /// `Blur`: a composition cut short by a focus change sends no other event.
+    /// See [`Ui::accept_ime`].
     pub fn ime_input(mut self, caret: impl Fn() -> crate::scene::Rect + 'static) -> Self {
         self.ime_caret = Some(Box::new(caret));
         self
